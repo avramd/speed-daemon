@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Speed Daemon</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <header class="topbar">
+      <h1>speed&middot;daemon</h1>
+      <form id="add-form" class="add-form">
+        <input id="f-label" placeholder="label" size="10" />
+        <input id="f-host" placeholder="host or IP" size="16" required />
+        <input id="f-tag" placeholder="tag" size="8" list="tag-options" />
+        <datalist id="tag-options"></datalist>
+        <input id="f-interval" type="number" value="1000" min="200" step="100" title="interval (ms)" />
+        <button type="submit">add</button>
+      </form>
+    </header>
+
+    <div class="controls">
+      <div id="ranges" class="ranges"></div>
+      <input id="scrub" class="scrub" type="range" min="0" max="1000" value="1000" />
+      <button id="live-btn" class="live-btn" title="Jump to live">● live</button>
+    </div>
+
+    <main id="rows" class="rows"></main>
+  </body>
+</html>

@@ -9,9 +9,34 @@ pub fn config_path(app: &tauri::AppHandle) -> tauri::Result<PathBuf> {
 
 pub fn load_or_default(path: &Path) -> AppConfig {
     match std::fs::read_to_string(path) {
-        Ok(s) => toml::from_str(&s).unwrap_or_else(|_| default_config()),
+        Ok(s) => match toml::from_str::<AppConfig>(&s) {
+            Ok(mut cfg) => {
+                // One-time upgrade: if the tag thresholds are still the original
+                // auto-generated defaults, adopt the new defaults (keeping the user's
+                // targets). Customized thresholds are left untouched.
+                if tags_are_legacy(&cfg.tags) {
+                    cfg.tags = default_config().tags;
+                }
+                cfg
+            }
+            Err(_) => default_config(),
+        },
         Err(_) => default_config(),
     }
+}
+
+/// True if `tags` matches the original 6/10/20/40-times-multiplier seed exactly.
+fn tags_are_legacy(tags: &[TagProfile]) -> bool {
+    let legacy = [
+        ("wifi", 6.0, 10.0, 20.0, 40.0),
+        ("gateway", 6.0, 10.0, 20.0, 40.0),
+        ("isp", 12.0, 20.0, 40.0, 80.0),
+        ("internet", 15.0, 25.0, 50.0, 100.0),
+    ];
+    tags.len() == legacy.len()
+        && tags.iter().zip(legacy.iter()).all(|(t, l)| {
+            t.tag == l.0 && t.good == l.1 && t.ok == l.2 && t.poor == l.3 && t.terrible == l.4
+        })
 }
 
 pub fn save(path: &Path, cfg: &AppConfig) -> anyhow::Result<()> {
@@ -32,13 +57,14 @@ fn target(id: &str, label: &str, host: &str, tag: &str) -> Target {
     }
 }
 
-fn profile(tag: &str, mult: f64) -> TagProfile {
+// good / ok / bad(poor) / max(terrible) cutoffs in ms.
+fn profile(tag: &str, good: f64, ok: f64, bad: f64, max: f64) -> TagProfile {
     TagProfile {
         tag: tag.into(),
-        good: 6.0 * mult,
-        ok: 10.0 * mult,
-        poor: 20.0 * mult,
-        terrible: 40.0 * mult,
+        good,
+        ok,
+        poor: bad,
+        terrible: max,
     }
 }
 
@@ -46,10 +72,11 @@ fn profile(tag: &str, mult: f64) -> TagProfile {
 /// edits hosts and thresholds in-app or directly in the TOML.
 pub fn default_config() -> AppConfig {
     let tags = vec![
-        profile("wifi", 1.0),
-        profile("gateway", 1.0),
-        profile("isp", 2.0),
-        profile("internet", 2.5),
+        // gateway follows LAN
+        profile("wifi", 10.0, 20.0, 40.0, 100.0),
+        profile("gateway", 10.0, 20.0, 40.0, 100.0),
+        profile("isp", 25.0, 40.0, 80.0, 150.0),
+        profile("internet", 30.0, 50.0, 100.0, 300.0),
     ];
 
     let targets = vec![

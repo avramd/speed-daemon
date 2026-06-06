@@ -1,12 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import {
-  drawBuckets,
-  statsFromBuckets,
-  bandColor,
-  type Bucket,
-  type TagProfile,
-} from "./render";
+import { drawBuckets, bandColor, type Bucket, type TagProfile } from "./render";
 
 interface Target {
   id: string;
@@ -27,19 +21,26 @@ interface SampleEvent {
   sample: { ts: number; rttMs: number | null };
 }
 
+interface WindowStats {
+  avg: number | null;
+  jitter: number | null;
+  lossPct: number;
+  count: number;
+}
+
 interface Row {
   target: Target;
   rowEl: HTMLElement;
   canvas: HTMLCanvasElement;
   chip: HTMLElement;
   labelEl: HTMLElement;
-  hostEl: HTMLElement;
-  ipEl: HTMLElement;
-  curEl: HTMLElement;
-  medEl: HTMLElement;
+  detailEl: HTMLElement;
+  avgEl: HTMLElement;
+  jitEl: HTMLElement;
   lossEl: HTMLElement;
-  view: HTMLElement;
-  editForm: HTMLFormElement;
+  hoverVal: HTMLElement;
+  buckets: Bucket[];
+  resolvedIp: string | null;
 }
 
 const RANGES: { key: string; sec: number }[] = [
@@ -53,22 +54,32 @@ const RANGES: { key: string; sec: number }[] = [
 const state = {
   rangeSec: 3600,
   live: true,
-  anchorFrac: 1, // 0 = oldest window, 1 = now (live)
+  anchorFrac: 1,
   oldestMs: Date.now(),
+  paused: false,
+  frozenTo: Date.now(),
 };
 
 const rows = new Map<string, Row>();
 let profiles = new Map<string, TagProfile>();
 let lastLiveRefresh = 0;
+let editingId: string | null = null;
 
 const rowsEl = document.querySelector<HTMLElement>("#rows")!;
+const modal = document.querySelector<HTMLElement>("#editor")!;
+const settingsModal = document.querySelector<HTMLElement>("#settings")!;
+
+// Settings categories map to tag names; gateway mirrors LAN.
+const CAT_TAG: Record<string, string> = { lan: "wifi", wan: "isp", inet: "internet" };
+const THRESH_DEFAULTS: Record<string, [number, number, number, number]> = {
+  lan: [10, 20, 40, 100],
+  wan: [25, 40, 80, 150],
+  inet: [30, 50, 100, 300],
+};
+
+const q = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
 // ---- helpers -------------------------------------------------------------
-
-function fmtMs(v: number | null): string {
-  if (v == null) return "—";
-  return v < 10 ? v.toFixed(1) : String(Math.round(v));
-}
 
 function fallbackProfile(): TagProfile {
   return { tag: "?", good: 6, ok: 10, poor: 20, terrible: 40 };
@@ -88,12 +99,43 @@ function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "t";
 }
 
+function fmtMs(v: number | null): string {
+  if (v == null) return "—";
+  return v < 10 ? v.toFixed(1) : String(Math.round(v));
+}
+
+function fmtLoss(p: number): string {
+  if (p <= 0) return "0%";
+  if (p < 1) return p.toFixed(1) + "%";
+  return `${Math.round(p)}%`;
+}
+
+// Loss color scale: <0.5% white, 0.5-1% yellow, 1-3% orange, >3% red.
+function lossColor(p: number): string {
+  if (p < 0.5) return "#e6edf3";
+  if (p <= 1) return "#d4c531";
+  if (p <= 3) return "#db8b2a";
+  return "#e5484d";
+}
+
+// Secondary identifier, with nothing repeated: show host only if it differs from the
+// label, and the resolved IP only if it differs from the host (so an IP-only target
+// shows its address exactly once — as the label).
+function detailText(target: Target, resolvedIp: string | null): string {
+  const parts: string[] = [];
+  if (target.label !== target.host) parts.push(target.host);
+  if (resolvedIp && resolvedIp !== target.host) parts.push(resolvedIp);
+  return parts.join("  ");
+}
+
 function currentWindow(): { from: number; to: number } {
   const now = Date.now();
   const rangeMs = state.rangeSec * 1000;
   const minEnd = state.oldestMs + rangeMs;
   let end: number;
-  if (state.live) {
+  if (state.paused) {
+    end = state.frozenTo;
+  } else if (state.live) {
     end = now;
   } else {
     end = minEnd + state.anchorFrac * Math.max(0, now - minEnd);
@@ -103,9 +145,9 @@ function currentWindow(): { from: number; to: number } {
 }
 
 function liveIntervalMs(): number {
-  if (state.rangeSec <= 43200) return 1000; // <=12h
-  if (state.rangeSec <= 86400) return 3000; // 1d
-  return 15000; // 1w
+  if (state.rangeSec <= 43200) return 1000;
+  if (state.rangeSec <= 86400) return 3000;
+  return 15000;
 }
 
 // ---- rendering -----------------------------------------------------------
@@ -113,32 +155,30 @@ function liveIntervalMs(): number {
 async function refreshRow(row: Row): Promise<void> {
   const { from, to } = currentWindow();
   const n = Math.max(1, Math.floor(row.canvas.clientWidth));
-  let buckets: Bucket[];
+  const id = row.target.id;
   try {
-    buckets = await invoke<Bucket[]>("get_window", {
-      targetId: row.target.id,
-      from,
-      to,
-      buckets: n,
-    });
-  } catch {
-    return;
-  }
-  const profile = profileFor(row.target.tag);
-  drawBuckets(row.canvas, buckets, profile);
+    const [buckets, stats] = await Promise.all([
+      invoke<Bucket[]>("get_window", { targetId: id, from, to, buckets: n }),
+      invoke<WindowStats>("get_stats", { targetId: id, from, to }),
+    ]);
+    const profile = profileFor(row.target.tag);
+    row.buckets = buckets;
+    drawBuckets(row.canvas, buckets, profile);
 
-  const s = statsFromBuckets(buckets);
-  if (s.current != null) {
-    row.curEl.textContent = fmtMs(s.current);
-    row.curEl.style.color = bandColor(s.current, profile);
+    row.avgEl.textContent = fmtMs(stats.avg);
+    row.avgEl.style.color = stats.avg == null ? "" : bandColor(stats.avg, profile);
+    row.jitEl.textContent = stats.jitter == null ? "—" : `±${fmtMs(stats.jitter)}`;
+    row.lossEl.textContent = fmtLoss(stats.lossPct);
+    row.lossEl.style.color = lossColor(stats.lossPct);
+  } catch {
+    /* ignore */
   }
-  row.medEl.textContent = `med ${fmtMs(s.median)}`;
-  row.lossEl.textContent = `${s.lossPct.toFixed(0)}% loss`;
-  row.lossEl.classList.toggle("bad", s.lossPct > 0);
 }
 
 async function refreshAll(): Promise<void> {
+  updateScrollbar();
   await Promise.all([...rows.values()].map(refreshRow));
+  if (hoverX != null) updateCrosshairAt(hoverX); // keep readout on the data under the cursor
 }
 
 let resizeTimer = 0;
@@ -147,7 +187,7 @@ function scheduleRefresh(): void {
   resizeTimer = window.setTimeout(refreshAll, 60);
 }
 
-// ---- row construction ----------------------------------------------------
+// ---- row construction (single line) -------------------------------------
 
 function buildRow(target: Target): Row {
   const rowEl = document.createElement("div");
@@ -158,153 +198,81 @@ function buildRow(target: Target): Row {
   handle.className = "handle";
   handle.textContent = "⠿";
   handle.title = "Drag to reorder";
-  handle.draggable = true;
 
-  // ---- meta (view + edit form) ----
-  const meta = document.createElement("div");
-  meta.className = "meta";
-
-  const view = document.createElement("div");
-  view.className = "view";
-
-  const top = document.createElement("div");
-  top.className = "meta-top";
   const chip = document.createElement("span");
   chip.className = "tag";
   chip.textContent = target.tag;
   chip.style.backgroundColor = tagColor(target.tag);
+
   const labelEl = document.createElement("span");
   labelEl.className = "label";
   labelEl.textContent = target.label;
-  top.append(chip, labelEl);
 
-  const sub = document.createElement("div");
-  sub.className = "meta-sub";
-  const hostEl = document.createElement("span");
-  hostEl.className = "host";
-  hostEl.textContent = target.host;
-  const ipEl = document.createElement("span");
-  ipEl.className = "ip";
-  sub.append(hostEl, ipEl);
+  const detailEl = document.createElement("span");
+  detailEl.className = "detail";
+  detailEl.textContent = detailText(target, null);
 
-  const stats = document.createElement("div");
-  stats.className = "stats";
-  const curEl = document.createElement("span");
-  curEl.className = "cur";
-  curEl.textContent = "—";
-  const medEl = document.createElement("span");
-  medEl.className = "med";
+  const meta = document.createElement("span");
+  meta.className = "meta";
+  meta.title = "Click to edit";
+  meta.append(chip, labelEl, detailEl);
+  meta.addEventListener("click", () => openEditor(target.id));
+
+  // ---- window stats column (avg / jitter / loss) ----
+  const wstats = document.createElement("div");
+  wstats.className = "wstats";
+  const avgEl = document.createElement("span");
+  avgEl.className = "val";
+  avgEl.textContent = "—";
+  const jitEl = document.createElement("span");
+  jitEl.className = "val";
+  jitEl.textContent = "—";
   const lossEl = document.createElement("span");
-  lossEl.className = "loss";
-  stats.append(curEl, medEl, lossEl);
-
-  view.append(top, sub, stats);
-
-  const editForm = buildEditForm(target);
-
-  meta.append(view, editForm);
+  lossEl.className = "val";
+  lossEl.textContent = "0%";
+  const statLine = (k: string, v: HTMLElement) => {
+    const line = document.createElement("div");
+    line.className = "wline";
+    const key = document.createElement("span");
+    key.className = "k";
+    key.textContent = k;
+    line.append(key, v);
+    return line;
+  };
+  wstats.append(statLine("avg", avgEl), statLine("jit", jitEl), statLine("loss", lossEl));
 
   const canvas = document.createElement("canvas");
   canvas.className = "strip";
 
-  const actions = document.createElement("div");
-  actions.className = "actions";
   const editBtn = document.createElement("button");
   editBtn.className = "icon";
   editBtn.textContent = "✎";
   editBtn.title = "Edit";
-  editBtn.addEventListener("click", () => toggleEdit(target.id, true));
-  const removeBtn = document.createElement("button");
-  removeBtn.className = "icon remove";
-  removeBtn.textContent = "×";
-  removeBtn.title = "Remove";
-  removeBtn.addEventListener("click", () => removeTarget(target.id));
-  actions.append(editBtn, removeBtn);
+  editBtn.addEventListener("click", () => openEditor(target.id));
 
-  rowEl.append(handle, meta, canvas, actions);
+  const hoverVal = document.createElement("span");
+  hoverVal.className = "hover-val";
+  hoverVal.hidden = true;
+
+  rowEl.append(handle, meta, wstats, canvas, editBtn, hoverVal);
   rowsEl.append(rowEl);
 
   wireDrag(handle, rowEl);
 
-  const row: Row = {
+  return {
     target,
     rowEl,
     canvas,
     chip,
     labelEl,
-    hostEl,
-    ipEl,
-    curEl,
-    medEl,
+    detailEl,
+    avgEl,
+    jitEl,
     lossEl,
-    view,
-    editForm,
+    hoverVal,
+    buckets: [],
+    resolvedIp: null,
   };
-  return row;
-}
-
-function buildEditForm(target: Target): HTMLFormElement {
-  const form = document.createElement("form");
-  form.className = "edit-form";
-  form.hidden = true;
-  form.innerHTML = `
-    <input class="e-label" placeholder="label" value="${escapeAttr(target.label)}" />
-    <input class="e-host" placeholder="host or IP" value="${escapeAttr(target.host)}" />
-    <input class="e-tag" placeholder="tag" value="${escapeAttr(target.tag)}" list="tag-options" />
-    <input class="e-interval" type="number" min="200" step="100" value="${target.intervalMs}" />
-    <div class="edit-actions">
-      <button type="submit" class="save">save</button>
-      <button type="button" class="cancel">cancel</button>
-    </div>`;
-  form.querySelector<HTMLButtonElement>(".cancel")!.addEventListener("click", () =>
-    toggleEdit(target.id, false),
-  );
-  form.addEventListener("submit", (e) => {
-    e.preventDefault();
-    saveEdit(target.id);
-  });
-  return form;
-}
-
-function escapeAttr(s: string): string {
-  return s.replace(/"/g, "&quot;");
-}
-
-function toggleEdit(id: string, editing: boolean): void {
-  const row = rows.get(id);
-  if (!row) return;
-  row.view.hidden = editing;
-  row.editForm.hidden = !editing;
-  if (editing) row.editForm.querySelector<HTMLInputElement>(".e-label")?.focus();
-}
-
-async function saveEdit(id: string): Promise<void> {
-  const row = rows.get(id);
-  if (!row) return;
-  const f = row.editForm;
-  const label = f.querySelector<HTMLInputElement>(".e-label")!.value.trim();
-  const host = f.querySelector<HTMLInputElement>(".e-host")!.value.trim();
-  const tag = f.querySelector<HTMLInputElement>(".e-tag")!.value.trim() || "internet";
-  const intervalMs = Math.max(
-    200,
-    parseInt(f.querySelector<HTMLInputElement>(".e-interval")!.value, 10) || 1000,
-  );
-  if (!host) return;
-
-  const updated: Target = { id, label: label || host, host, tag, intervalMs };
-  try {
-    await invoke<AppConfig>("update_target", { target: updated });
-  } catch (e) {
-    console.error("update_target failed", e);
-    return;
-  }
-  row.target = updated;
-  row.labelEl.textContent = updated.label;
-  row.hostEl.textContent = updated.host;
-  row.chip.textContent = updated.tag;
-  row.chip.style.backgroundColor = tagColor(updated.tag);
-  toggleEdit(id, false);
-  refreshRow(row);
 }
 
 async function addRow(target: Target): Promise<void> {
@@ -327,28 +295,169 @@ async function removeTarget(id: string): Promise<void> {
   }
 }
 
-// ---- drag reorder --------------------------------------------------------
+// ---- edit pop-up ---------------------------------------------------------
 
-function wireDrag(handle: HTMLElement, rowEl: HTMLElement): void {
-  handle.addEventListener("dragstart", (e) => {
-    rowEl.classList.add("dragging");
-    e.dataTransfer?.setData("text/plain", rowEl.dataset.id ?? "");
-    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+function openEditor(id: string): void {
+  const row = rows.get(id);
+  if (!row) return;
+  editingId = id;
+  q<HTMLInputElement>("#m-label").value = row.target.label;
+  q<HTMLInputElement>("#m-host").value = row.target.host;
+  q<HTMLInputElement>("#m-tag").value = row.target.tag;
+  q<HTMLInputElement>("#m-interval").value = String(row.target.intervalMs);
+  modal.hidden = false;
+  q<HTMLInputElement>("#m-label").focus();
+}
+
+function closeEditor(): void {
+  modal.hidden = true;
+  editingId = null;
+}
+
+async function saveEditor(): Promise<void> {
+  if (!editingId) return;
+  const row = rows.get(editingId);
+  if (!row) return;
+  const label = q<HTMLInputElement>("#m-label").value.trim();
+  const host = q<HTMLInputElement>("#m-host").value.trim();
+  const tag = q<HTMLInputElement>("#m-tag").value.trim() || "internet";
+  const intervalMs = Math.max(
+    200,
+    parseInt(q<HTMLInputElement>("#m-interval").value, 10) || 1000,
+  );
+  if (!host) return;
+
+  const updated: Target = { id: editingId, label: label || host, host, tag, intervalMs };
+  try {
+    await invoke<AppConfig>("update_target", { target: updated });
+  } catch (e) {
+    console.error("update_target failed", e);
+    return;
+  }
+  row.target = updated;
+  row.labelEl.textContent = updated.label;
+  row.chip.textContent = updated.tag;
+  row.chip.style.backgroundColor = tagColor(updated.tag);
+  row.detailEl.textContent = detailText(updated, row.resolvedIp);
+  closeEditor();
+  refreshRow(row);
+}
+
+async function removeFromEditor(): Promise<void> {
+  if (!editingId) return;
+  const id = editingId;
+  closeEditor();
+  await removeTarget(id);
+}
+
+function wireEditor(): void {
+  q<HTMLButtonElement>("#m-save").addEventListener("click", saveEditor);
+  q<HTMLButtonElement>("#m-cancel").addEventListener("click", closeEditor);
+  q<HTMLButtonElement>("#m-remove").addEventListener("click", removeFromEditor);
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) closeEditor(); // click backdrop to dismiss
   });
-  handle.addEventListener("dragend", () => {
-    rowEl.classList.remove("dragging");
-    persistOrder();
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modal.hidden) closeEditor();
   });
 }
 
-rowsEl.addEventListener("dragover", (e) => {
-  e.preventDefault();
-  const dragging = rowsEl.querySelector<HTMLElement>(".row.dragging");
-  if (!dragging) return;
-  const after = rowAfter(e.clientY);
-  if (after == null) rowsEl.appendChild(dragging);
-  else rowsEl.insertBefore(dragging, after);
-});
+// ---- settings (thresholds) pop-up ---------------------------------------
+
+function setCat(cat: string, vals: [number, number, number, number]): void {
+  q<HTMLInputElement>(`#s-${cat}-good`).value = String(vals[0]);
+  q<HTMLInputElement>(`#s-${cat}-ok`).value = String(vals[1]);
+  q<HTMLInputElement>(`#s-${cat}-bad`).value = String(vals[2]);
+  q<HTMLInputElement>(`#s-${cat}-max`).value = String(vals[3]);
+}
+
+function getCat(cat: string): [number, number, number, number] {
+  const num = (id: string) => Math.max(1, parseFloat(q<HTMLInputElement>(id).value) || 0);
+  return [
+    num(`#s-${cat}-good`),
+    num(`#s-${cat}-ok`),
+    num(`#s-${cat}-bad`),
+    num(`#s-${cat}-max`),
+  ];
+}
+
+function openSettings(): void {
+  for (const cat of Object.keys(CAT_TAG)) {
+    const p = profiles.get(CAT_TAG[cat]);
+    setCat(cat, p ? [p.good, p.ok, p.poor, p.terrible] : THRESH_DEFAULTS[cat]);
+  }
+  settingsModal.hidden = false;
+}
+
+function closeSettings(): void {
+  settingsModal.hidden = true;
+}
+
+async function saveSettings(): Promise<void> {
+  const mk = (tag: string, v: [number, number, number, number]): TagProfile => ({
+    tag,
+    good: v[0],
+    ok: v[1],
+    poor: v[2],
+    terrible: v[3],
+  });
+  const lan = getCat("lan");
+  const byTag = new Map(profiles);
+  byTag.set("wifi", mk("wifi", lan));
+  byTag.set("gateway", mk("gateway", lan)); // gateway follows LAN
+  byTag.set("isp", mk("isp", getCat("wan")));
+  byTag.set("internet", mk("internet", getCat("inet")));
+  const tags = [...byTag.values()];
+  try {
+    await invoke("set_tags", { tags });
+  } catch (e) {
+    console.error("set_tags failed", e);
+    return;
+  }
+  profiles = new Map(tags.map((t) => [t.tag, t]));
+  closeSettings();
+  refreshAll();
+}
+
+function wireSettings(): void {
+  q<HTMLButtonElement>("#settings-btn").addEventListener("click", openSettings);
+  q<HTMLButtonElement>("#s-save").addEventListener("click", saveSettings);
+  q<HTMLButtonElement>("#s-cancel").addEventListener("click", closeSettings);
+  q<HTMLButtonElement>("#s-reset").addEventListener("click", () => {
+    for (const cat of Object.keys(THRESH_DEFAULTS)) setCat(cat, THRESH_DEFAULTS[cat]);
+  });
+  settingsModal.addEventListener("click", (e) => {
+    if (e.target === settingsModal) closeSettings();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !settingsModal.hidden) closeSettings();
+  });
+}
+
+// ---- drag reorder --------------------------------------------------------
+
+// Pointer-based reorder. (HTML5 drag-and-drop is unreliable inside the macOS WKWebView,
+// where Tauri's OS-level drag-drop handler intercepts the events.)
+function wireDrag(handle: HTMLElement, rowEl: HTMLElement): void {
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    rowEl.classList.add("dragging");
+
+    const onMove = (ev: PointerEvent) => {
+      const after = rowAfter(ev.clientY);
+      if (after == null) rowsEl.appendChild(rowEl);
+      else if (after !== rowEl) rowsEl.insertBefore(rowEl, after);
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      rowEl.classList.remove("dragging");
+      persistOrder();
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  });
+}
 
 function rowAfter(y: number): HTMLElement | null {
   const els = [...rowsEl.querySelectorAll<HTMLElement>(".row:not(.dragging)")];
@@ -360,9 +469,7 @@ function rowAfter(y: number): HTMLElement | null {
 }
 
 async function persistOrder(): Promise<void> {
-  const order = [...rowsEl.querySelectorAll<HTMLElement>(".row")].map(
-    (el) => el.dataset.id!,
-  );
+  const order = [...rowsEl.querySelectorAll<HTMLElement>(".row")].map((el) => el.dataset.id!);
   try {
     await invoke("reorder_targets", { order });
   } catch (e) {
@@ -373,61 +480,132 @@ async function persistOrder(): Promise<void> {
 // ---- controls ------------------------------------------------------------
 
 function buildControls(): void {
-  const rangeWrap = document.querySelector<HTMLElement>("#ranges")!;
+  const rangeWrap = q<HTMLElement>("#ranges");
   for (const r of RANGES) {
     const btn = document.createElement("button");
     btn.className = "range" + (r.sec === state.rangeSec ? " active" : "");
     btn.textContent = r.key;
-    btn.dataset.sec = String(r.sec);
     btn.addEventListener("click", () => {
       state.rangeSec = r.sec;
-      rangeWrap
-        .querySelectorAll(".range")
-        .forEach((b) => b.classList.toggle("active", b === btn));
+      rangeWrap.querySelectorAll(".range").forEach((b) => b.classList.toggle("active", b === btn));
       refreshAll();
     });
     rangeWrap.append(btn);
   }
 
-  const slider = document.querySelector<HTMLInputElement>("#scrub")!;
-  const liveBtn = document.querySelector<HTMLButtonElement>("#live-btn")!;
-  slider.addEventListener("input", () => {
-    const v = parseInt(slider.value, 10);
-    state.anchorFrac = v / 1000;
-    state.live = v >= 1000;
-    liveBtn.classList.toggle("active", state.live);
-    scheduleRefresh();
+  const track = q<HTMLElement>("#scrub");
+  const liveBtn = q<HTMLButtonElement>("#live-btn");
+
+  track.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    setPaused(false); // manual navigation resumes from any freeze
+    const rect = track.getBoundingClientRect();
+    const geo = thumbGeometry();
+    const thumb = q<HTMLElement>("#scrub-thumb");
+    const pressX = e.clientX - rect.left;
+    const thumbLeft = (state.live ? 1 : state.anchorFrac) * geo.maxLeft;
+    const onThumb = e.target === thumb && pressX >= thumbLeft && pressX <= thumbLeft + geo.thumbW;
+    const grab = onThumb ? pressX - thumbLeft : geo.thumbW / 2;
+
+    let lastRefresh = 0;
+    const apply = (clientX: number) => {
+      const x = clientX - rect.left - grab;
+      const nl = Math.min(geo.maxLeft, Math.max(0, x));
+      state.anchorFrac = geo.maxLeft > 0 ? nl / geo.maxLeft : 1;
+      state.live = state.anchorFrac >= 0.999;
+      liveBtn.classList.toggle("active", state.live);
+      updateScrollbar();
+      // Throttle (not debounce) so the graphs scroll live while dragging.
+      const now = Date.now();
+      if (now - lastRefresh >= 60) {
+        lastRefresh = now;
+        refreshAll();
+      }
+    };
+    apply(e.clientX);
+    const onMove = (ev: PointerEvent) => apply(ev.clientX);
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      refreshAll(); // settle on the final position
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
   });
+
   liveBtn.addEventListener("click", () => {
     state.live = true;
     state.anchorFrac = 1;
-    slider.value = "1000";
+    setPaused(false);
     liveBtn.classList.add("active");
+    updateScrollbar();
     refreshAll();
   });
   liveBtn.classList.toggle("active", state.live);
+
+  q<HTMLButtonElement>("#pause-btn").addEventListener("click", togglePause);
+}
+
+// Scrollbar thumb sizing: width = window / total-data-span, position from anchor.
+function thumbGeometry(): { thumbW: number; maxLeft: number } {
+  const track = q<HTMLElement>("#scrub");
+  const trackW = track.clientWidth;
+  const span = Math.max(1, Date.now() - state.oldestMs);
+  const windowMs = state.rangeSec * 1000;
+  const frac = Math.min(1, windowMs / span);
+  const thumbW = Math.min(trackW, Math.max(16, frac * trackW));
+  const maxLeft = Math.max(0, trackW - thumbW);
+  return { thumbW, maxLeft };
+}
+
+function updateScrollbar(): void {
+  const thumb = q<HTMLElement>("#scrub-thumb");
+  const { thumbW, maxLeft } = thumbGeometry();
+  const now = Date.now();
+  const minEnd = state.oldestMs + state.rangeSec * 1000;
+  const denom = now - minEnd;
+  const frac = denom <= 0 ? 1 : Math.min(1, Math.max(0, (currentWindow().to - minEnd) / denom));
+  thumb.style.width = `${thumbW}px`;
+  thumb.style.transform = `translateX(${frac * maxLeft}px)`;
+}
+
+function setPaused(on: boolean): void {
+  state.paused = on;
+  const btn = q<HTMLButtonElement>("#pause-btn");
+  btn.textContent = on ? "▶" : "⏸";
+  btn.classList.toggle("active", on);
+  btn.title = on ? "Resume" : "Pause (freeze view)";
+}
+
+function togglePause(): void {
+  if (!state.paused) {
+    state.frozenTo = currentWindow().to; // freeze whatever is currently shown
+    setPaused(true);
+  } else {
+    setPaused(false);
+  }
+  updateScrollbar();
+  refreshAll();
 }
 
 function wireAddForm(): void {
-  const form = document.querySelector<HTMLFormElement>("#add-form")!;
-  const labelI = document.querySelector<HTMLInputElement>("#f-label")!;
-  const hostI = document.querySelector<HTMLInputElement>("#f-host")!;
-  const tagI = document.querySelector<HTMLInputElement>("#f-tag")!;
-  const intervalI = document.querySelector<HTMLInputElement>("#f-interval")!;
+  const form = q<HTMLFormElement>("#add-form");
+  const labelI = q<HTMLInputElement>("#f-label");
+  const hostI = q<HTMLInputElement>("#f-host");
+  const tagI = q<HTMLInputElement>("#f-tag");
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const label = labelI.value.trim();
     const host = hostI.value.trim();
     const tag = tagI.value.trim() || "internet";
-    const intervalMs = Math.max(200, parseInt(intervalI.value, 10) || 1000);
     if (!host) return;
     const target: Target = {
       id: `${slug(label || host)}-${Math.floor(Math.random() * 1e6)}`,
       label: label || host,
       host,
       tag,
-      intervalMs,
+      intervalMs: 1000,
     };
     try {
       await invoke<AppConfig>("add_target", { target });
@@ -441,13 +619,78 @@ function wireAddForm(): void {
 }
 
 function populateTagOptions(): void {
-  const list = document.querySelector<HTMLDataListElement>("#tag-options")!;
+  const list = q<HTMLDataListElement>("#tag-options");
   list.innerHTML = "";
   for (const t of profiles.keys()) {
     const opt = document.createElement("option");
     opt.value = t;
     list.append(opt);
   }
+}
+
+// ---- hover crosshair -----------------------------------------------------
+
+let crosshairLine: HTMLElement | null = null;
+let hoverX: number | null = null; // last cursor X (viewport), re-read on every refresh
+
+function wireCrosshair(): void {
+  crosshairLine = document.createElement("div");
+  crosshairLine.className = "crosshair-line";
+  crosshairLine.hidden = true;
+  document.body.append(crosshairLine);
+
+  rowsEl.addEventListener("pointermove", (e) => {
+    hoverX = e.clientX;
+    updateCrosshairAt(hoverX);
+  });
+  rowsEl.addEventListener("pointerleave", () => {
+    hoverX = null;
+    hideCrosshair();
+  });
+}
+
+// Map a viewport X to a bucket index and refresh the line + per-row values. Called both
+// on pointer move and after each data refresh, so the readout tracks live data under it.
+function updateCrosshairAt(clientX: number): void {
+  const first = rows.values().next().value as Row | undefined;
+  if (!first) {
+    hideCrosshair();
+    return;
+  }
+  // All strips are left-aligned and share the time window, so one strip's geometry maps
+  // the cursor to the same bucket index in every row.
+  const rect = first.canvas.getBoundingClientRect();
+  if (clientX < rect.left || clientX > rect.right || rect.width === 0) {
+    hideCrosshair();
+    return;
+  }
+  const n = first.buckets.length || Math.floor(rect.width);
+  if (n === 0) return;
+  const i = Math.max(0, Math.min(n - 1, Math.floor(((clientX - rect.left) / rect.width) * n)));
+  showCrosshair(clientX, rect.right, i);
+}
+
+function showCrosshair(clientX: number, stripRight: number, i: number): void {
+  if (!crosshairLine) return;
+  const rrect = rowsEl.getBoundingClientRect();
+  crosshairLine.style.left = `${clientX}px`;
+  crosshairLine.style.top = `${rrect.top}px`;
+  crosshairLine.style.height = `${rrect.height}px`;
+  crosshairLine.hidden = false;
+
+  const flip = clientX > stripRight - 44; // near right edge -> draw label to the left
+  for (const row of rows.values()) {
+    const b = row.buckets[i];
+    row.hoverVal.textContent = b && b.worst != null ? fmtMs(b.worst) : "-";
+    row.hoverVal.style.left = `${clientX - row.rowEl.getBoundingClientRect().left}px`;
+    row.hoverVal.classList.toggle("flip", flip);
+    row.hoverVal.hidden = false;
+  }
+}
+
+function hideCrosshair(): void {
+  if (crosshairLine) crosshairLine.hidden = true;
+  for (const row of rows.values()) row.hoverVal.hidden = true;
 }
 
 // ---- bootstrap -----------------------------------------------------------
@@ -468,32 +711,31 @@ async function main(): Promise<void> {
   buildControls();
   populateTagOptions();
   wireAddForm();
+  wireEditor();
+  wireSettings();
+  wireCrosshair();
   await refreshBounds();
 
   for (const target of cfg.targets) {
     await addRow(target);
   }
 
-  // Live current-value updates between full refreshes.
   await listen<SampleEvent>("sample", (event) => {
-    const { targetId, resolvedIp, sample } = event.payload;
+    const { targetId, resolvedIp } = event.payload;
     const row = rows.get(targetId);
     if (!row) return;
-    if (state.live && sample.rttMs != null) {
-      row.curEl.textContent = fmtMs(sample.rttMs);
-      row.curEl.style.color = bandColor(sample.rttMs, profileFor(row.target.tag));
-    }
-    if (resolvedIp && row.ipEl.textContent !== resolvedIp) {
-      row.ipEl.textContent = resolvedIp;
+    if (resolvedIp && resolvedIp !== row.resolvedIp) {
+      row.resolvedIp = resolvedIp;
+      row.detailEl.textContent = detailText(row.target, resolvedIp);
     }
   });
 
-  // Redraw to fit on resize (bucket count = canvas width).
   new ResizeObserver(scheduleRefresh).observe(rowsEl);
+  window.addEventListener("resize", updateScrollbar);
+  updateScrollbar();
 
-  // Live refresh loop (tiered by range) + periodic bounds refresh.
   window.setInterval(() => {
-    if (state.live && Date.now() - lastLiveRefresh >= liveIntervalMs()) {
+    if (!state.paused && state.live && Date.now() - lastLiveRefresh >= liveIntervalMs()) {
       lastLiveRefresh = Date.now();
       refreshAll();
     }

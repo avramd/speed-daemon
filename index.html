@@ -15,18 +15,81 @@
         <input id="f-label" placeholder="label" size="10" />
         <input id="f-host" placeholder="host or IP" size="16" required />
         <input id="f-tag" placeholder="tag" size="8" list="tag-options" />
-        <datalist id="tag-options"></datalist>
-        <input id="f-interval" type="number" value="1000" min="200" step="100" title="interval (ms)" />
         <button type="submit">add</button>
       </form>
+      <span class="topbar-spacer"></span>
+      <button id="settings-btn" class="icon-btn" title="Thresholds">⚙</button>
     </header>
 
     <div class="controls">
       <div id="ranges" class="ranges"></div>
-      <input id="scrub" class="scrub" type="range" min="0" max="1000" value="1000" />
+      <div id="scrub" class="scrub" title="Drag to scroll through history">
+        <div id="scrub-thumb" class="scrub-thumb"></div>
+      </div>
+      <button id="pause-btn" class="live-btn" title="Pause (freeze view)">⏸</button>
       <button id="live-btn" class="live-btn" title="Jump to live">● live</button>
     </div>
 
     <main id="rows" class="rows"></main>
+
+    <datalist id="tag-options"></datalist>
+
+    <!-- edit pop-up -->
+    <div id="editor" class="modal" hidden>
+      <div class="dialog">
+        <h2>Edit target</h2>
+        <label>Label <input id="m-label" /></label>
+        <label>Host / IP <input id="m-host" /></label>
+        <label>Tag <input id="m-tag" list="tag-options" /></label>
+        <label>Delay <span class="unit">ms between probes</span>
+          <input id="m-interval" type="number" min="200" step="100" />
+        </label>
+        <div class="dialog-actions">
+          <button id="m-remove" class="danger" type="button">Remove</button>
+          <span class="spacer"></span>
+          <button id="m-cancel" type="button">Cancel</button>
+          <button id="m-save" class="primary" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- thresholds settings pop-up -->
+    <div id="settings" class="modal" hidden>
+      <div class="dialog wide">
+        <h2>Response-time thresholds (ms)</h2>
+        <div class="thresh-grid">
+          <span></span>
+          <span class="th-head">good</span>
+          <span class="th-head">ok</span>
+          <span class="th-head">bad</span>
+          <span class="th-head">max</span>
+
+          <label class="th-row">LAN</label>
+          <input id="s-lan-good" type="number" min="1" step="1" />
+          <input id="s-lan-ok" type="number" min="1" step="1" />
+          <input id="s-lan-bad" type="number" min="1" step="1" />
+          <input id="s-lan-max" type="number" min="1" step="1" />
+
+          <label class="th-row">WAN</label>
+          <input id="s-wan-good" type="number" min="1" step="1" />
+          <input id="s-wan-ok" type="number" min="1" step="1" />
+          <input id="s-wan-bad" type="number" min="1" step="1" />
+          <input id="s-wan-max" type="number" min="1" step="1" />
+
+          <label class="th-row">Internet</label>
+          <input id="s-inet-good" type="number" min="1" step="1" />
+          <input id="s-inet-ok" type="number" min="1" step="1" />
+          <input id="s-inet-bad" type="number" min="1" step="1" />
+          <input id="s-inet-max" type="number" min="1" step="1" />
+        </div>
+        <p class="hint">Gateway follows LAN. “max” is the graph ceiling — higher values clip to full height.</p>
+        <div class="dialog-actions">
+          <button id="s-reset" type="button">Reset to defaults</button>
+          <span class="spacer"></span>
+          <button id="s-cancel" type="button">Cancel</button>
+          <button id="s-save" class="primary" type="button">Save</button>
+        </div>
+      </div>
+    </div>
   </body>
 </html>

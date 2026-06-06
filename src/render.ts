@@ -36,6 +36,7 @@ export function bandColor(rtt: number, p: TagProfile): string {
   return RED;
 }
 
+// Fixed scale: bottom = 1ms, top = `hi` (the tag's `max`). Values >= hi clip to full height.
 function logHeight(rtt: number, hi: number, rowH: number): number {
   const LO = 1;
   const r = Math.max(rtt, LO);
@@ -67,7 +68,7 @@ export function drawBuckets(
   ctx.fillStyle = BG;
   ctx.fillRect(0, 0, cssW, cssH);
 
-  const hi = profile.terrible * 2.5;
+  const hi = profile.terrible; // graph ceiling = the tag's "max"
   const n = buckets.length;
   // Buckets map 1:1 to pixels when we asked for floor(width) of them; if not, scale x.
   const scale = n > 0 ? cssW / n : 1;

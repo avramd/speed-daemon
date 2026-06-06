@@ -1,6 +1,6 @@
 use crate::config;
 use crate::db::Db;
-use crate::model::{AppConfig, Bucket, TagProfile, Target};
+use crate::model::{AppConfig, Bucket, TagProfile, Target, WindowStats};
 use crate::probes::Probes;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,6 +32,12 @@ pub fn get_window(
     buckets: usize,
 ) -> Vec<Bucket> {
     db.window(&target_id, from, to, buckets)
+}
+
+/// Mean / jitter / loss% over [from, to) for one target.
+#[tauri::command]
+pub fn get_stats(db: State<Arc<Db>>, target_id: String, from: u64, to: u64) -> WindowStats {
+    db.stats(&target_id, from, to)
 }
 
 /// Earliest instant known to the store (for slider bounds). 0 if empty.

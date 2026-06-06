@@ -1,4 +1,4 @@
-use crate::model::Bucket;
+use crate::model::{Bucket, WindowStats};
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
@@ -89,6 +89,43 @@ impl Db {
             (Some(a), None) => Some(a as u64),
             (None, Some(b)) => Some(b as u64),
             (None, None) => None,
+        }
+    }
+
+    /// Mean / jitter (std dev) / loss% over raw samples in [from, to) for one target.
+    pub fn stats(&self, target_id: &str, from: u64, to: u64) -> WindowStats {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT AVG(rtt), AVG(rtt*rtt), COUNT(*), COUNT(rtt) \
+                 FROM samples WHERE target_id = ?1 AND ts >= ?2 AND ts < ?3",
+                rusqlite::params![target_id, from as i64, to as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<f64>>(0)?,
+                        r.get::<_, Option<f64>>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap_or((None, None, 0, 0));
+
+        let (avg, avg_sq, total, recv) = row;
+        let jitter = match (avg, avg_sq) {
+            (Some(a), Some(sq)) if recv > 0 => Some((sq - a * a).max(0.0).sqrt()),
+            _ => None,
+        };
+        let loss_pct = if total > 0 {
+            (total - recv) as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        WindowStats {
+            avg,
+            jitter,
+            loss_pct,
+            count: total as u32,
         }
     }
 

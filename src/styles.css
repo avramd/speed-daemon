@@ -52,18 +52,13 @@ body {
   align-items: center;
 }
 
-.add-form input,
-.edit-form input {
+.add-form input {
   background: var(--panel);
   border: 1px solid var(--line);
   color: var(--text);
   border-radius: 4px;
   padding: 3px 6px;
   font: inherit;
-}
-
-.add-form input[type="number"] {
-  width: 70px;
 }
 
 .add-form button {
@@ -122,7 +117,34 @@ body {
 
 .scrub {
   flex: 1;
-  accent-color: #1f6feb;
+  position: relative;
+  height: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  touch-action: none;
+  overflow: hidden;
+}
+
+.scrub-thumb {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  width: 100%;
+  background: #2c5aa8;
+  border-radius: 8px;
+  cursor: grab;
+}
+
+.scrub-thumb:hover {
+  background: #3a6cbf;
+}
+
+.scrub-thumb:active {
+  cursor: grabbing;
+  background: #4178d6;
 }
 
 .live-btn {
@@ -140,7 +162,12 @@ body {
   border-color: #2ea043;
 }
 
-/* ---- rows ---- */
+#pause-btn.active {
+  color: #d4c531;
+  border-color: #8a7d1f;
+}
+
+/* ---- rows (single line each) ---- */
 .rows {
   display: flex;
   flex-direction: column;
@@ -148,10 +175,11 @@ body {
 
 .row {
   display: flex;
-  align-items: stretch;
-  gap: 6px;
-  padding: 3px 12px 3px 0;
+  align-items: center;
+  gap: 8px;
+  padding: 1px 10px 1px 0;
   border-bottom: 1px solid var(--line);
+  position: relative;
 }
 
 .row:hover {
@@ -164,12 +192,15 @@ body {
 }
 
 .handle {
-  display: flex;
-  align-items: center;
-  padding: 0 4px;
-  color: #3b424b;
+  color: var(--muted);
   cursor: grab;
   font-size: 14px;
+  padding: 0 3px 0 6px;
+  touch-action: none;
+}
+
+.handle:hover {
+  color: var(--text);
 }
 
 .handle:active {
@@ -177,24 +208,19 @@ body {
 }
 
 .meta {
-  width: 230px;
-  min-width: 230px;
-  padding: 4px 4px;
-  overflow: hidden;
-}
-
-.view {
+  width: 250px;
+  min-width: 250px;
   display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.meta-top {
-  display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 6px;
-  white-space: nowrap;
   overflow: hidden;
+  white-space: nowrap;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.meta:hover {
+  background: #1a212b;
 }
 
 .tag {
@@ -204,117 +230,246 @@ body {
   padding: 0 5px;
   border-radius: 3px;
   text-transform: lowercase;
+  align-self: center;
 }
 
 .label {
   font-weight: 600;
+  flex-shrink: 0;
+  max-width: 130px;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.meta-sub {
-  display: flex;
-  gap: 8px;
+.detail {
   color: var(--muted);
-  white-space: nowrap;
   overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.meta-sub .ip {
-  color: #586069;
-}
-
-.stats {
+.wstats {
+  width: 56px;
+  min-width: 56px;
   display: flex;
-  gap: 10px;
-  margin-top: 1px;
+  flex-direction: column;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1.2;
 }
 
-.stats .cur {
-  font-weight: 600;
-  min-width: 34px;
+.wline {
+  display: flex;
+  gap: 4px;
 }
 
-.stats .med,
-.stats .loss {
+.wline .k {
+  color: #8b949e;
+  width: 24px;
+  text-align: right;
+  flex: none;
+}
+
+.wline .val {
+  font-variant-numeric: tabular-nums;
+  color: #e6edf3;
+}
+
+.strip {
+  flex: 1;
+  height: 34px;
+  display: block;
+  background: var(--bg);
+  border-radius: 2px;
+  min-width: 0;
+}
+
+/* ---- hover crosshair ---- */
+.crosshair-line {
+  position: fixed;
+  width: 1px;
+  background: rgba(230, 237, 243, 0.4);
+  pointer-events: none;
+  z-index: 5;
+}
+
+.hover-val {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  margin-left: 5px;
+  pointer-events: none;
+  z-index: 6;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: #e6edf3;
+  background: rgba(13, 17, 23, 0.85);
+  padding: 0 4px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.hover-val.flip {
+  transform: translate(-100%, -50%);
+  margin-left: -5px;
+}
+
+.icon {
+  background: transparent;
+  border: none;
   color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 6px;
 }
 
-.stats .loss.bad {
-  color: #e5484d;
+.icon:hover {
+  color: #58a6ff;
 }
 
-/* ---- inline edit form ---- */
-.edit-form {
+/* ---- edit pop-up ---- */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+}
+
+.modal[hidden] {
+  display: none;
+}
+
+.dialog {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px 18px;
+  width: 320px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.dialog h2 {
+  margin: 0 0 12px;
+  font-size: 13px;
+  color: #8b949e;
+}
+
+.dialog label {
   display: flex;
   flex-direction: column;
   gap: 3px;
+  margin-bottom: 10px;
+  color: var(--muted);
 }
 
-.edit-form input {
-  width: 100%;
+.dialog .unit {
+  color: #4b525b;
+  font-size: 11px;
 }
 
-.edit-form input[type="number"] {
-  width: 80px;
-}
-
-.edit-actions {
-  display: flex;
-  gap: 4px;
-  margin-top: 2px;
-}
-
-.edit-form .save {
-  background: #1f6feb;
-  color: #fff;
-  border: none;
+.dialog input {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--text);
   border-radius: 4px;
-  padding: 2px 8px;
+  padding: 5px 7px;
+  font: inherit;
+}
+
+.dialog-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.dialog-actions .spacer {
+  flex: 1;
+}
+
+.dialog-actions button {
+  border-radius: 4px;
+  padding: 5px 12px;
   font: inherit;
   cursor: pointer;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
 }
 
-.edit-form .cancel {
+.dialog-actions .primary {
+  background: #1f6feb;
+  border-color: #1f6feb;
+  color: #fff;
+}
+
+.dialog-actions .danger {
+  color: #e5484d;
+  border-color: #43262a;
+}
+
+.dialog-actions .danger:hover {
+  background: #2a1719;
+}
+
+/* ---- topbar settings button ---- */
+.topbar-spacer {
+  flex: 1;
+}
+
+.icon-btn {
   background: var(--panel);
   border: 1px solid var(--line);
   color: var(--muted);
   border-radius: 4px;
   padding: 2px 8px;
   font: inherit;
-  cursor: pointer;
-}
-
-/* ---- strip chart ---- */
-.strip {
-  flex: 1;
-  height: 40px;
-  display: block;
-  background: var(--bg);
-  border-radius: 2px;
-  align-self: center;
-  min-width: 0;
-}
-
-.actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.icon {
-  background: transparent;
-  border: none;
-  color: #3b424b;
   font-size: 14px;
   cursor: pointer;
-  padding: 0 4px;
 }
 
-.icon:hover {
+.icon-btn:hover {
   color: var(--text);
 }
 
-.icon.remove:hover {
-  color: #e5484d;
+/* ---- thresholds settings ---- */
+.dialog.wide {
+  width: 360px;
+}
+
+.thresh-grid {
+  display: grid;
+  grid-template-columns: auto repeat(4, 1fr);
+  gap: 6px 8px;
+  align-items: center;
+}
+
+.th-head {
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.th-row {
+  color: var(--text);
+  margin: 0;
+}
+
+.thresh-grid input {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 5px;
+  font: inherit;
+  width: 100%;
+  text-align: right;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 11px;
+  margin: 12px 0 0;
 }

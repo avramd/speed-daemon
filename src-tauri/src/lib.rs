@@ -63,6 +63,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_config,
             commands::get_window,
+            commands::get_stats,
             commands::get_bounds,
             commands::add_target,
             commands::update_target,

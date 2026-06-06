@@ -69,3 +69,13 @@ pub struct Bucket {
     pub count: u32,
     pub up: bool,
 }
+
+/// Per-sample summary over a window: mean RTT, jitter (std dev of RTT), loss %.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowStats {
+    pub avg: Option<f64>,
+    pub jitter: Option<f64>,
+    pub loss_pct: f64,
+    pub count: u32,
+}

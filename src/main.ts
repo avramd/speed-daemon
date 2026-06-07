@@ -693,6 +693,324 @@ function hideCrosshair(): void {
   for (const row of rows.values()) row.hoverVal.hidden = true;
 }
 
+// ---- network / pairing ---------------------------------------------------
+
+interface NodeInfo {
+  id: string;
+  name: string;
+  mode: string;
+}
+interface DiscoPeer {
+  id: string;
+  name: string;
+  addr: string;
+  lastSeen: number;
+}
+interface PeerInfo {
+  id: string;
+  name: string;
+  role: string;
+  addr?: string | null;
+}
+
+let node: NodeInfo = { id: "", name: "", mode: "client" };
+const netModal = document.querySelector<HTMLElement>("#network")!;
+const inviteModal = document.querySelector<HTMLElement>("#invite")!;
+let inviteServerId: string | null = null;
+let inviteTimer = 0;
+
+function applyMode(): void {
+  const badge = q<HTMLElement>("#mode-badge");
+  badge.textContent = node.mode;
+  badge.classList.toggle("server", node.mode === "server");
+  q<HTMLElement>("#server-pane").hidden = node.mode !== "server";
+  document.querySelectorAll<HTMLInputElement>('input[name="mode"]').forEach((r) => {
+    r.checked = r.value === node.mode;
+  });
+}
+
+function renderDiscovered(list: DiscoPeer[]): void {
+  const el = q<HTMLElement>("#n-discovered");
+  el.innerHTML = "";
+  if (!list.length) {
+    el.innerHTML = '<div class="net-empty">none yet — press Scan</div>';
+    return;
+  }
+  for (const p of list) {
+    const row = document.createElement("div");
+    row.className = "net-item";
+    const name = document.createElement("span");
+    name.textContent = p.name;
+    const addr = document.createElement("span");
+    addr.className = "net-addr";
+    addr.textContent = p.addr;
+    const btn = document.createElement("button");
+    btn.textContent = "invite";
+    btn.addEventListener("click", async () => {
+      const msg = prompt(
+        `Message to ${p.name}:`,
+        `${node.name} would like to run probes on your machine.`,
+      );
+      if (msg == null) return;
+      await invoke("net_invite", { peerId: p.id, message: msg });
+    });
+    row.append(name, addr, btn);
+    el.append(row);
+  }
+}
+
+function renderPeers(list: PeerInfo[]): void {
+  const el = q<HTMLElement>("#n-peers");
+  el.innerHTML = "";
+  if (!list.length) {
+    el.innerHTML = '<div class="net-empty">no paired peers</div>';
+    return;
+  }
+  for (const p of list) {
+    const row = document.createElement("div");
+    row.className = "net-item";
+    const name = document.createElement("span");
+    name.textContent = p.name;
+    const role = document.createElement("span");
+    role.className = "net-addr";
+    role.textContent = p.role; // "client" = we manage it; "server" = it manages us
+    row.append(name, role);
+    el.append(row);
+  }
+}
+
+async function openNetwork(): Promise<void> {
+  q<HTMLInputElement>("#n-name").value = node.name;
+  applyMode();
+  renderPeers(await invoke<PeerInfo[]>("get_peers"));
+  renderDiscovered(await invoke<DiscoPeer[]>("net_discovered"));
+  netModal.hidden = false;
+}
+
+function showInvite(p: { fromId: string; fromName: string; msg: string }): void {
+  inviteServerId = p.fromId;
+  q<HTMLElement>("#inv-text").textContent = `“${p.fromName}” wants to run probes on this machine: ${
+    p.msg || "(no message)"
+  }`;
+  inviteModal.hidden = false;
+  let left = 300;
+  const tick = () => {
+    q<HTMLElement>("#inv-timer").textContent = `Expires in ${Math.floor(left / 60)}:${String(
+      left % 60,
+    ).padStart(2, "0")}`;
+    if (left <= 0) respondInvite(false);
+    left -= 1;
+  };
+  clearInterval(inviteTimer);
+  tick();
+  inviteTimer = window.setInterval(tick, 1000);
+}
+
+async function respondInvite(accept: boolean): Promise<void> {
+  clearInterval(inviteTimer);
+  inviteModal.hidden = true;
+  if (inviteServerId) await invoke("net_respond_invite", { serverId: inviteServerId, accept });
+  inviteServerId = null;
+}
+
+async function reloadTargets(): Promise<void> {
+  const cfg = await invoke<AppConfig>("get_config");
+  profiles = new Map(cfg.tags.map((t) => [t.tag, t]));
+  for (const t of cfg.targets) {
+    if (!rows.has(t.id)) await addRow(t);
+  }
+}
+
+function wireNetwork(): void {
+  q<HTMLButtonElement>("#net-btn").addEventListener("click", openNetwork);
+  q<HTMLButtonElement>("#n-close").addEventListener("click", () => (netModal.hidden = true));
+  netModal.addEventListener("click", (e) => {
+    if (e.target === netModal) netModal.hidden = true;
+  });
+  q<HTMLInputElement>("#n-name").addEventListener("change", async (e) => {
+    node = await invoke<NodeInfo>("set_node_name", { name: (e.target as HTMLInputElement).value });
+    applyMode();
+  });
+  document.querySelectorAll<HTMLInputElement>('input[name="mode"]').forEach((r) =>
+    r.addEventListener("change", async (e) => {
+      node = await invoke<NodeInfo>("set_mode", { mode: (e.target as HTMLInputElement).value });
+      applyMode();
+    }),
+  );
+  q<HTMLButtonElement>("#n-discover").addEventListener("click", async () => {
+    await invoke("net_discover_now");
+    setTimeout(async () => renderDiscovered(await invoke<DiscoPeer[]>("net_discovered")), 900);
+  });
+  q<HTMLButtonElement>("#inv-accept").addEventListener("click", () => respondInvite(true));
+  q<HTMLButtonElement>("#inv-decline").addEventListener("click", () => respondInvite(false));
+
+  listen<DiscoPeer[]>("net-discovered", (e) => renderDiscovered(e.payload));
+  listen<PeerInfo[]>("net-peers", (e) => renderPeers(e.payload));
+  listen<{ fromId: string; fromName: string; msg: string }>("net-invite", (e) =>
+    showInvite(e.payload),
+  );
+  listen("targets-changed", () => reloadTargets());
+}
+
+// ---- remote results (source-tagged) --------------------------------------
+
+interface RemoteResult {
+  id: number;
+  host: string;
+  tag: string;
+  label: string;
+  rttMs: number | null;
+  lossPct: number;
+  intervalMs: number;
+}
+interface RemoteEvent {
+  fromId: string;
+  fromName: string;
+  ts: number;
+  results: RemoteResult[];
+}
+interface RNode {
+  fromId: string;
+  fromName: string;
+  host: string;
+  tag: string;
+  label: string;
+  rttMs: number | null;
+  lossPct: number;
+  ts: number;
+  buffer: Bucket[];
+}
+
+const remotes = new Map<string, RNode>();
+
+function onRemote(ev: RemoteEvent): void {
+  for (const r of ev.results) {
+    const key = `${ev.fromId}:${r.id}`;
+    let n = remotes.get(key);
+    if (!n) {
+      n = {
+        fromId: ev.fromId,
+        fromName: ev.fromName,
+        host: r.host,
+        tag: r.tag,
+        label: r.label || r.host,
+        rttMs: r.rttMs,
+        lossPct: r.lossPct,
+        ts: ev.ts,
+        buffer: [],
+      };
+      remotes.set(key, n);
+    }
+    Object.assign(n, {
+      fromName: ev.fromName,
+      host: r.host,
+      tag: r.tag,
+      label: r.label || r.host,
+      rttMs: r.rttMs,
+      lossPct: r.lossPct,
+      ts: ev.ts,
+    });
+    n.buffer.push({ t: ev.ts, worst: r.rttMs, loss: (r.lossPct || 0) / 100, count: 1, up: true });
+    if (n.buffer.length > 300) n.buffer.shift();
+  }
+  refreshFilterOptions();
+  renderRemote();
+}
+
+function refreshFilterOptions(): void {
+  const sel = q<HTMLSelectElement>("#r-filter");
+  const sources = new Map<string, string>();
+  for (const n of remotes.values()) sources.set(n.fromId, n.fromName);
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">all</option>';
+  for (const [id, name] of sources) {
+    const o = document.createElement("option");
+    o.value = id;
+    o.textContent = name;
+    sel.append(o);
+  }
+  sel.value = cur;
+}
+
+function remoteRowEl(n: RNode): HTMLElement {
+  const profile = profileFor(n.tag);
+  const row = document.createElement("div");
+  row.className = "row remote-row";
+  row.style.borderLeftColor = tagColor(n.fromId);
+
+  const src = document.createElement("span");
+  src.className = "src";
+  src.style.backgroundColor = tagColor(n.fromId);
+  src.textContent = n.fromName;
+
+  const meta = document.createElement("span");
+  meta.className = "meta";
+  const chip = document.createElement("span");
+  chip.className = "tag";
+  chip.textContent = n.tag;
+  chip.style.backgroundColor = tagColor(n.tag);
+  const label = document.createElement("span");
+  label.className = "label";
+  label.textContent = n.label;
+  const detail = document.createElement("span");
+  detail.className = "detail";
+  detail.textContent = n.label !== n.host ? n.host : "";
+  meta.append(chip, label, detail);
+
+  const wrap = document.createElement("div");
+  wrap.className = "wstats";
+  const line = (k: string, text: string, color: string) => {
+    const l = document.createElement("div");
+    l.className = "wline";
+    const ke = document.createElement("span");
+    ke.className = "k";
+    ke.textContent = k;
+    const v = document.createElement("span");
+    v.className = "val";
+    v.textContent = text;
+    if (color) v.style.color = color;
+    l.append(ke, v);
+    return l;
+  };
+  wrap.append(
+    line("avg", fmtMs(n.rttMs), n.rttMs == null ? "" : bandColor(n.rttMs, profile)),
+    line("loss", fmtLoss(n.lossPct), lossColor(n.lossPct)),
+  );
+
+  const canvas = document.createElement("canvas");
+  canvas.className = "strip";
+
+  row.append(src, meta, wrap, canvas);
+  requestAnimationFrame(() => drawBuckets(canvas, n.buffer, profile));
+  return row;
+}
+
+function renderRemote(): void {
+  const section = q<HTMLElement>("#remote-section");
+  const host = q<HTMLElement>("#remote-rows");
+  section.hidden = remotes.size === 0;
+  const filter = q<HTMLSelectElement>("#r-filter").value;
+  const sort = q<HTMLSelectElement>("#r-sort").value;
+
+  let list = [...remotes.values()];
+  if (filter) list = list.filter((n) => n.fromId === filter);
+  list.sort((a, b) => {
+    if (sort === "name") return a.label.localeCompare(b.label);
+    if (sort === "rtt") return (b.rttMs ?? -1) - (a.rttMs ?? -1);
+    if (sort === "loss") return b.lossPct - a.lossPct;
+    return a.fromName.localeCompare(b.fromName) || a.label.localeCompare(b.label);
+  });
+
+  host.innerHTML = "";
+  for (const n of list) host.append(remoteRowEl(n));
+}
+
+function wireRemote(): void {
+  q<HTMLSelectElement>("#r-filter").addEventListener("change", renderRemote);
+  q<HTMLSelectElement>("#r-sort").addEventListener("change", renderRemote);
+  listen<RemoteEvent>("net-remote", (e) => onRemote(e.payload));
+}
+
 // ---- bootstrap -----------------------------------------------------------
 
 async function refreshBounds(): Promise<void> {
@@ -714,6 +1032,10 @@ async function main(): Promise<void> {
   wireEditor();
   wireSettings();
   wireCrosshair();
+  wireNetwork();
+  wireRemote();
+  node = await invoke<NodeInfo>("get_node");
+  applyMode();
   await refreshBounds();
 
   for (const target of cfg.targets) {

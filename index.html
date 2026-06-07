@@ -18,6 +18,8 @@
         <button type="submit">add</button>
       </form>
       <span class="topbar-spacer"></span>
+      <span id="mode-badge" class="mode-badge">client</span>
+      <button id="net-btn" class="icon-btn" title="Network">🛰</button>
       <button id="settings-btn" class="icon-btn" title="Thresholds">⚙</button>
     </header>
 
@@ -31,6 +33,24 @@
     </div>
 
     <main id="rows" class="rows"></main>
+
+    <section id="remote-section" class="remote-section" hidden>
+      <div class="remote-head">
+        <span class="remote-title">remote</span>
+        <label>source
+          <select id="r-filter"><option value="">all</option></select>
+        </label>
+        <label>sort
+          <select id="r-sort">
+            <option value="source">source</option>
+            <option value="name">name</option>
+            <option value="rtt">rtt</option>
+            <option value="loss">loss</option>
+          </select>
+        </label>
+      </div>
+      <div id="remote-rows" class="rows"></div>
+    </section>
 
     <datalist id="tag-options"></datalist>
 
@@ -88,6 +108,52 @@
           <span class="spacer"></span>
           <button id="s-cancel" type="button">Cancel</button>
           <button id="s-save" class="primary" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- network pop-up -->
+    <div id="network" class="modal" hidden>
+      <div class="dialog wide">
+        <h2>Network</h2>
+        <label>This machine
+          <input id="n-name" placeholder="name" />
+        </label>
+        <div class="mode-row">
+          <span>Mode</span>
+          <label><input type="radio" name="mode" value="client" /> Client</label>
+          <label><input type="radio" name="mode" value="server" /> Server</label>
+        </div>
+
+        <div id="server-pane" hidden>
+          <div class="net-head">
+            <span>Discovered clients</span>
+            <button id="n-discover" type="button">Scan</button>
+          </div>
+          <div id="n-discovered" class="net-list"></div>
+        </div>
+
+        <div class="net-head"><span>Paired</span></div>
+        <div id="n-peers" class="net-list"></div>
+
+        <div class="dialog-actions">
+          <span class="spacer"></span>
+          <button id="n-close" class="primary" type="button">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- incoming invite dialog (client) -->
+    <div id="invite" class="modal" hidden>
+      <div class="dialog">
+        <h2>Pairing invitation</h2>
+        <p id="inv-text"></p>
+        <p class="warn">⚠ Do not accept unexpected invitations.</p>
+        <p class="hint" id="inv-timer"></p>
+        <div class="dialog-actions">
+          <button id="inv-decline" class="danger" type="button">Decline</button>
+          <span class="spacer"></span>
+          <button id="inv-accept" class="primary" type="button">Accept</button>
         </div>
       </div>
     </div>

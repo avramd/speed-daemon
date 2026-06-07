@@ -1,14 +1,43 @@
-use crate::model::{AppConfig, TagProfile, Target};
+use crate::model::{AppConfig, NodeInfo, TagProfile, Target};
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
-/// `<app config dir>/config.toml` — e.g. ~/Library/Application Support/org.est.speeddaemon/
+/// Random lowercase-hex string of `n` bytes (2n chars). Used for node ids and secrets.
+pub fn random_hex(n: usize) -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    (0..n).map(|_| format!("{:02x}", rng.random::<u8>())).collect()
+}
+
+fn default_name() -> String {
+    gethostname::gethostname().to_string_lossy().to_string()
+}
+
+/// Fill in a stable identity / default mode the first time (or after an upgrade).
+fn ensure_node(cfg: &mut AppConfig) {
+    if cfg.node.id.is_empty() {
+        cfg.node.id = random_hex(8);
+    }
+    if cfg.node.name.is_empty() {
+        cfg.node.name = default_name();
+    }
+    if cfg.node.mode.is_empty() {
+        cfg.node.mode = "client".into();
+    }
+}
+
+/// `<data dir>/config.toml`. The data dir is normally the OS app-config dir
+/// (~/Library/Application Support/org.est.speeddaemon/), but `SPEED_DAEMON_DIR` overrides
+/// it — used so a dev instance keeps its own data and never disturbs the real collector.
 pub fn config_path(app: &tauri::AppHandle) -> tauri::Result<PathBuf> {
+    if let Ok(dir) = std::env::var("SPEED_DAEMON_DIR") {
+        return Ok(PathBuf::from(dir).join("config.toml"));
+    }
     Ok(app.path().app_config_dir()?.join("config.toml"))
 }
 
 pub fn load_or_default(path: &Path) -> AppConfig {
-    match std::fs::read_to_string(path) {
+    let mut cfg = match std::fs::read_to_string(path) {
         Ok(s) => match toml::from_str::<AppConfig>(&s) {
             Ok(mut cfg) => {
                 // One-time upgrade: if the tag thresholds are still the original
@@ -22,7 +51,9 @@ pub fn load_or_default(path: &Path) -> AppConfig {
             Err(_) => default_config(),
         },
         Err(_) => default_config(),
-    }
+    };
+    ensure_node(&mut cfg);
+    cfg
 }
 
 /// True if `tags` matches the original 6/10/20/40-times-multiplier seed exactly.
@@ -91,5 +122,10 @@ pub fn default_config() -> AppConfig {
         target("net-ibm", "ibm.com", "ibm.com", "internet"),
     ];
 
-    AppConfig { targets, tags }
+    AppConfig {
+        targets,
+        tags,
+        node: NodeInfo::default(),
+        peers: Vec::new(),
+    }
 }

@@ -1,28 +1,29 @@
 use crate::config;
 use crate::db::Db;
-use crate::model::{AppConfig, Bucket, TagProfile, Target, WindowStats};
+use crate::model::{AppConfig, Bucket, NodeInfo, Peer, TagProfile, Target, WindowStats};
+use crate::net::Net;
 use crate::probes::Probes;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
 
-/// Live configuration + where it persists. Managed as Tauri state.
+/// Live configuration + where it persists. Managed (as `Arc`) so net tasks share it.
 pub struct ConfigState {
     pub config: Mutex<AppConfig>,
     pub path: PathBuf,
 }
 
-fn persist(state: &ConfigState, cfg: &AppConfig) -> Result<(), String> {
-    config::save(&state.path, cfg).map_err(|e| e.to_string())
+fn save(cfg: &ConfigState, c: &AppConfig) -> Result<(), String> {
+    config::save(&cfg.path, c).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_config(cfg: State<ConfigState>) -> AppConfig {
+pub fn get_config(cfg: State<Arc<ConfigState>>) -> AppConfig {
     cfg.config.lock().unwrap().clone()
 }
 
-/// Aggregated history for one target over [from, to) into `buckets` pixel columns.
 #[tauri::command]
 pub fn get_window(
     db: State<Arc<Db>>,
@@ -34,13 +35,11 @@ pub fn get_window(
     db.window(&target_id, from, to, buckets)
 }
 
-/// Mean / jitter / loss% over [from, to) for one target.
 #[tauri::command]
 pub fn get_stats(db: State<Arc<Db>>, target_id: String, from: u64, to: u64) -> WindowStats {
     db.stats(&target_id, from, to)
 }
 
-/// Earliest instant known to the store (for slider bounds). 0 if empty.
 #[tauri::command]
 pub fn get_bounds(db: State<Arc<Db>>) -> u64 {
     db.oldest().unwrap_or(0)
@@ -50,70 +49,78 @@ pub fn get_bounds(db: State<Arc<Db>>) -> u64 {
 pub fn add_target(
     app: AppHandle,
     db: State<Arc<Db>>,
-    probes: State<Probes>,
-    cfg: State<ConfigState>,
+    probes: State<Arc<Probes>>,
+    cfg: State<Arc<ConfigState>>,
+    net: State<Arc<Net>>,
     target: Target,
 ) -> Result<AppConfig, String> {
-    let mut guard = cfg.config.lock().unwrap();
-    if guard.targets.iter().any(|t| t.id == target.id) {
-        return Err(format!("target id '{}' already exists", target.id));
-    }
-    guard.targets.push(target.clone());
-    persist(&cfg, &guard)?;
-
+    let result = {
+        let mut guard = cfg.config.lock().unwrap();
+        if guard.targets.iter().any(|t| t.id == target.id) {
+            return Err(format!("target id '{}' already exists", target.id));
+        }
+        guard.targets.push(target.clone());
+        save(&cfg, &guard)?;
+        guard.clone()
+    };
     let stop = probes.start(&target.id);
     crate::probe::spawn_probe(app, db.inner().clone(), target, stop);
-    Ok(guard.clone())
+    net.reassign_all();
+    Ok(result)
 }
 
 #[tauri::command]
 pub fn update_target(
     app: AppHandle,
     db: State<Arc<Db>>,
-    probes: State<Probes>,
-    cfg: State<ConfigState>,
+    probes: State<Arc<Probes>>,
+    cfg: State<Arc<ConfigState>>,
+    net: State<Arc<Net>>,
     target: Target,
 ) -> Result<AppConfig, String> {
-    let mut guard = cfg.config.lock().unwrap();
-
-    // Only restart the probe when something it depends on changed; a pure
-    // label/tag rename keeps the existing probe (and history is on disk regardless).
-    let needs_restart = match guard.targets.iter().find(|t| t.id == target.id) {
-        Some(old) => old.host != target.host || old.interval_ms != target.interval_ms,
-        None => true,
+    let (result, needs_restart) = {
+        let mut guard = cfg.config.lock().unwrap();
+        let needs_restart = match guard.targets.iter().find(|t| t.id == target.id) {
+            Some(old) => old.host != target.host || old.interval_ms != target.interval_ms,
+            None => true,
+        };
+        match guard.targets.iter_mut().find(|t| t.id == target.id) {
+            Some(slot) => *slot = target.clone(),
+            None => guard.targets.push(target.clone()),
+        }
+        save(&cfg, &guard)?;
+        (guard.clone(), needs_restart)
     };
-
-    match guard.targets.iter_mut().find(|t| t.id == target.id) {
-        Some(slot) => *slot = target.clone(),
-        None => guard.targets.push(target.clone()),
-    }
-    persist(&cfg, &guard)?;
-
     if needs_restart {
         probes.stop(&target.id);
         let stop = probes.start(&target.id);
         crate::probe::spawn_probe(app, db.inner().clone(), target, stop);
     }
-    Ok(guard.clone())
+    net.reassign_all();
+    Ok(result)
 }
 
 #[tauri::command]
 pub fn remove_target(
-    probes: State<Probes>,
-    cfg: State<ConfigState>,
+    probes: State<Arc<Probes>>,
+    cfg: State<Arc<ConfigState>>,
+    net: State<Arc<Net>>,
     target_id: String,
 ) -> Result<AppConfig, String> {
-    let mut guard = cfg.config.lock().unwrap();
-    guard.targets.retain(|t| t.id != target_id);
-    persist(&cfg, &guard)?;
+    let result = {
+        let mut guard = cfg.config.lock().unwrap();
+        guard.targets.retain(|t| t.id != target_id);
+        save(&cfg, &guard)?;
+        guard.clone()
+    };
     probes.stop(&target_id);
-    Ok(guard.clone())
+    net.reassign_all();
+    Ok(result)
 }
 
-/// Reorder targets to match the given list of ids (others appended, unknown ignored).
 #[tauri::command]
 pub fn reorder_targets(
-    cfg: State<ConfigState>,
+    cfg: State<Arc<ConfigState>>,
     order: Vec<String>,
 ) -> Result<AppConfig, String> {
     let mut guard = cfg.config.lock().unwrap();
@@ -125,19 +132,65 @@ pub fn reorder_targets(
             ordered.push(t);
         }
     }
-    // Any target not named in `order` keeps its place at the end.
     ordered.extend(by_id.into_values());
     guard.targets = ordered;
-    persist(&cfg, &guard)?;
+    save(&cfg, &guard)?;
     Ok(guard.clone())
 }
 
-/// Update tag expectation profiles. Tags only affect frontend coloring/scaling, so no
-/// probe restart is needed.
 #[tauri::command]
-pub fn set_tags(cfg: State<ConfigState>, tags: Vec<TagProfile>) -> Result<AppConfig, String> {
+pub fn set_tags(cfg: State<Arc<ConfigState>>, tags: Vec<TagProfile>) -> Result<AppConfig, String> {
     let mut guard = cfg.config.lock().unwrap();
     guard.tags = tags;
-    persist(&cfg, &guard)?;
+    save(&cfg, &guard)?;
     Ok(guard.clone())
+}
+
+// ---- networking ----------------------------------------------------------
+
+#[tauri::command]
+pub fn get_node(cfg: State<Arc<ConfigState>>) -> NodeInfo {
+    cfg.config.lock().unwrap().node.clone()
+}
+
+#[tauri::command]
+pub fn set_mode(cfg: State<Arc<ConfigState>>, mode: String) -> Result<NodeInfo, String> {
+    let mut guard = cfg.config.lock().unwrap();
+    guard.node.mode = if mode == "server" { "server" } else { "client" }.into();
+    save(&cfg, &guard)?;
+    Ok(guard.node.clone())
+}
+
+#[tauri::command]
+pub fn set_node_name(cfg: State<Arc<ConfigState>>, name: String) -> Result<NodeInfo, String> {
+    let mut guard = cfg.config.lock().unwrap();
+    guard.node.name = name;
+    save(&cfg, &guard)?;
+    Ok(guard.node.clone())
+}
+
+#[tauri::command]
+pub fn get_peers(cfg: State<Arc<ConfigState>>) -> Vec<Peer> {
+    cfg.config.lock().unwrap().peers.clone()
+}
+
+#[tauri::command]
+pub fn net_discovered(net: State<Arc<Net>>) -> Vec<Value> {
+    net.discovered_list()
+}
+
+#[tauri::command]
+pub async fn net_discover_now(net: State<'_, Arc<Net>>) -> Result<(), String> {
+    net.discover_now(true).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn net_invite(net: State<Arc<Net>>, peer_id: String, message: String) {
+    net.invite(peer_id, message);
+}
+
+#[tauri::command]
+pub fn net_respond_invite(net: State<Arc<Net>>, server_id: String, accept: bool) {
+    net.respond_invite(server_id, accept);
 }

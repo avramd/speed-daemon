@@ -31,11 +31,48 @@ fn default_interval() -> u64 {
     1000
 }
 
-/// Whole persisted configuration: probe targets + tag expectation profiles.
+/// This app's network identity + role.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeInfo {
+    pub id: String,
+    pub name: String,
+    /// "client" (default) or "server".
+    pub mode: String,
+}
+
+impl Default for NodeInfo {
+    fn default() -> Self {
+        NodeInfo {
+            id: String::new(),
+            name: String::new(),
+            mode: "client".into(),
+        }
+    }
+}
+
+/// A paired peer and the shared secret negotiated at accept time. `role` is the peer's
+/// role relative to us: "server" = it directs us; "client" = we direct it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Peer {
+    pub id: String,
+    pub name: String,
+    pub secret: String,
+    pub role: String,
+    #[serde(default)]
+    pub addr: Option<String>,
+}
+
+/// Whole persisted configuration: probe targets + tag expectation profiles + networking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub targets: Vec<Target>,
     pub tags: Vec<TagProfile>,
+    #[serde(default)]
+    pub node: NodeInfo,
+    #[serde(default)]
+    pub peers: Vec<Peer>,
 }
 
 /// One measurement. `rtt_ms == None` means no response (loss) — rendered as a gap.

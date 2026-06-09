@@ -16,16 +16,36 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 
+/// Dev-only (macOS): this file's presence/mtime drives the application-level hide so the
+/// dev window stays out of the way (and survives `tauri dev` relaunches), while ⌘-tab /
+/// LaunchBar / Dock still unhide it natively. Toggled by `bin/dev-mode hide` / `show`.
+#[cfg(all(debug_assertions, target_os = "macos"))]
+const DEV_HIDE_FLAG: &str = "/tmp/speed-daemon-dev.hidden";
+
+#[cfg(all(debug_assertions, target_os = "macos"))]
+fn flag_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(DEV_HIDE_FLAG)
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        // Single instance first: a second launch focuses the running one (one collector).
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    #[allow(unused_mut)] // `mut` is only used by the release-only cfg block below
+    let mut builder = tauri::Builder::default();
+    // Single-instance only in release builds, so a dev build can run alongside the
+    // installed collector (they share the bundle identifier). A second launch of the
+    // real app focuses the running one (one collector).
+    #[cfg(not(debug_assertions))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.set_focus();
             }
-        }))
+        }));
+    }
+    builder
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -38,32 +58,38 @@ pub fn run() {
             let cfg = config::load_or_default(&cfg_path);
             let _ = config::save(&cfg_path, &cfg);
 
+            // Read-only viewer (dev): share the real instance's files, but don't poll,
+            // write, heartbeat, prune, or run networking — just read the live history.
+            let readonly = std::env::var("SPEED_DAEMON_READONLY").is_ok();
+
             let db_path = cfg_path
                 .parent()
                 .map(|p| p.join("history.db"))
                 .unwrap_or_else(|| "history.db".into());
-            let db = Arc::new(Db::open(&db_path)?);
-            db.prune();
+            let db = Arc::new(Db::open(&db_path, readonly)?);
 
             let probes = Arc::new(Probes::new());
-            for t in &cfg.targets {
-                let stop = probes.start(&t.id);
-                probe::spawn_probe(handle.clone(), db.clone(), t.clone(), stop);
-            }
-
-            // Heartbeat (keeps the uptime row fresh) + periodic prune.
-            let hb_db = db.clone();
-            tauri::async_runtime::spawn(async move {
-                let mut ticks: u64 = 0;
-                loop {
-                    hb_db.heartbeat();
-                    ticks += 1;
-                    if ticks % 720 == 0 {
-                        hb_db.prune();
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+            if !readonly {
+                db.prune();
+                for t in &cfg.targets {
+                    let stop = probes.start(&t.id);
+                    probe::spawn_probe(handle.clone(), db.clone(), t.clone(), stop);
                 }
-            });
+
+                // Heartbeat (keeps the uptime row fresh) + periodic prune.
+                let hb_db = db.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut ticks: u64 = 0;
+                    loop {
+                        hb_db.heartbeat();
+                        ticks += 1;
+                        if ticks % 720 == 0 {
+                            hb_db.prune();
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                });
+            }
 
             let cfg_state = Arc::new(ConfigState {
                 config: Mutex::new(cfg),
@@ -71,7 +97,9 @@ pub fn run() {
             });
 
             let net = Net::new(handle.clone(), db.clone(), probes.clone(), cfg_state.clone());
-            net.start();
+            if !readonly {
+                net.start();
+            }
 
             app.manage(db);
             app.manage(probes);
@@ -121,11 +149,45 @@ pub fn run() {
 
             // Closing the window hides it instead of quitting (keep collecting).
             if let Some(win) = handle.get_webview_window("main") {
+                #[cfg(debug_assertions)]
+                let _ = win.set_title("Speed Daemon (dev)");
                 let w = win.clone();
                 win.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
                         let _ = w.hide();
+                    }
+                });
+            }
+
+            // Dev (macOS): application-level hide driven by the hide-flag, edge-triggered on
+            // the file's mtime so a native unhide (⌘-tab / LaunchBar / Dock) isn't fought.
+            #[cfg(all(debug_assertions, target_os = "macos"))]
+            {
+                if std::path::Path::new(DEV_HIDE_FLAG).exists() {
+                    let _ = handle.hide(); // start hidden if flagged (e.g. relaunch during churn)
+                }
+                let h = handle.clone();
+                let mut last = flag_mtime();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        let cur = flag_mtime();
+                        match (last, cur) {
+                            // flag created or touched -> hide the app
+                            (l, Some(m)) if l != Some(m) => {
+                                let _ = h.hide();
+                            }
+                            // flag removed -> show + focus
+                            (Some(_), None) => {
+                                let _ = h.show();
+                                if let Some(w) = h.get_webview_window("main") {
+                                    let _ = w.set_focus();
+                                }
+                            }
+                            _ => {}
+                        }
+                        last = cur;
                     }
                 });
             }
@@ -142,6 +204,7 @@ pub fn run() {
             commands::remove_target,
             commands::reorder_targets,
             commands::set_tags,
+            commands::set_theme,
             commands::get_node,
             commands::set_mode,
             commands::set_node_name,

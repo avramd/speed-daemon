@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { drawBuckets, bandColor, type Bucket, type TagProfile } from "./render";
+import { drawBuckets, bandColor, refreshPalette, type Bucket, type TagProfile } from "./render";
 
 interface Target {
   id: string;
@@ -13,6 +13,7 @@ interface Target {
 interface AppConfig {
   targets: Target[];
   tags: TagProfile[];
+  theme?: string;
 }
 
 interface SampleEvent {
@@ -44,6 +45,7 @@ interface Row {
 }
 
 const RANGES: { key: string; sec: number }[] = [
+  { key: "15m", sec: 900 },
   { key: "1h", sec: 3600 },
   { key: "6h", sec: 21600 },
   { key: "12h", sec: 43200 },
@@ -110,12 +112,57 @@ function fmtLoss(p: number): string {
   return `${Math.round(p)}%`;
 }
 
-// Loss color scale: <0.5% white, 0.5-1% yellow, 1-3% orange, >3% red.
+// Loss color scale: <0.5% normal (theme text), 0.5-1% yellow, 1-3% orange, >3% red.
 function lossColor(p: number): string {
-  if (p < 0.5) return "#e6edf3";
+  if (p < 0.5) return ""; // inherit theme text color
   if (p <= 1) return "#d4c531";
   if (p <= 3) return "#db8b2a";
   return "#e5484d";
+}
+
+// ---- theme ----
+let themeSetting = "system";
+const themeMql = window.matchMedia("(prefers-color-scheme: dark)");
+
+function effectiveDark(): boolean {
+  return themeSetting === "dark" || (themeSetting === "system" && themeMql.matches);
+}
+function applyTheme(): void {
+  const root = document.documentElement;
+  const dark = effectiveDark();
+  root.classList.toggle("theme-dark", dark);
+  root.classList.toggle("theme-light", !dark);
+  refreshPalette();
+  refreshAll();
+}
+themeMql.addEventListener("change", () => {
+  if (themeSetting === "system") applyTheme();
+});
+
+// ---- scrub time formatting + snapping ----
+// Snap the window edge to natural local-time boundaries per range.
+const SNAP_MS: Record<number, number> = {
+  900: 5 * 60_000,
+  3600: 15 * 60_000,
+  21600: 60 * 60_000,
+  43200: 2 * 60 * 60_000,
+  86400: 4 * 60 * 60_000,
+  604800: 6 * 60 * 60_000,
+};
+function snapEnd(end: number): number {
+  const step = SNAP_MS[state.rangeSec];
+  if (!step) return end;
+  const offMs = new Date().getTimezoneOffset() * 60_000; // align in local wall-clock time
+  const local = end - offMs;
+  return Math.round(local / step) * step + offMs;
+}
+function fmtDateTime(ms: number): string {
+  return new Date(ms).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 // Secondary identifier, with nothing repeated: show host only if it differs from the
@@ -386,6 +433,9 @@ function openSettings(): void {
     const p = profiles.get(CAT_TAG[cat]);
     setCat(cat, p ? [p.good, p.ok, p.poor, p.terrible] : THRESH_DEFAULTS[cat]);
   }
+  document.querySelectorAll<HTMLInputElement>('input[name="theme"]').forEach((r) => {
+    r.checked = r.value === themeSetting;
+  });
   settingsModal.hidden = false;
 }
 
@@ -426,6 +476,17 @@ function wireSettings(): void {
   q<HTMLButtonElement>("#s-reset").addEventListener("click", () => {
     for (const cat of Object.keys(THRESH_DEFAULTS)) setCat(cat, THRESH_DEFAULTS[cat]);
   });
+  document.querySelectorAll<HTMLInputElement>('input[name="theme"]').forEach((r) =>
+    r.addEventListener("change", async (e) => {
+      themeSetting = (e.target as HTMLInputElement).value;
+      try {
+        await invoke("set_theme", { theme: themeSetting });
+      } catch {
+        /* ignore */
+      }
+      applyTheme();
+    }),
+  );
   settingsModal.addEventListener("click", (e) => {
     if (e.target === settingsModal) closeSettings();
   });
@@ -508,23 +569,56 @@ function buildControls(): void {
     const grab = onThumb ? pressX - thumbLeft : geo.thumbW / 2;
 
     let lastRefresh = 0;
+    let preciseMode = false;
+    let fineTimer = 0;
+    let lastX = e.clientX;
+    let lastClientX = e.clientX;
+
     const apply = (clientX: number) => {
-      const x = clientX - rect.left - grab;
-      const nl = Math.min(geo.maxLeft, Math.max(0, x));
-      state.anchorFrac = geo.maxLeft > 0 ? nl / geo.maxLeft : 1;
+      lastClientX = clientX;
+      const now = Date.now();
+      const rangeMs = state.rangeSec * 1000;
+      const minEnd = state.oldestMs + rangeMs;
+      const span = Math.max(1, now - minEnd);
+      const nl = Math.min(geo.maxLeft, Math.max(0, clientX - rect.left - grab));
+      const rawFrac = geo.maxLeft > 0 ? nl / geo.maxLeft : 1;
+      const rawEnd = minEnd + rawFrac * span;
+      const end = preciseMode ? rawEnd : snapEnd(rawEnd); // snap unless precise
+      state.anchorFrac = Math.min(1, Math.max(0, (end - minEnd) / span));
       state.live = state.anchorFrac >= 0.999;
       liveBtn.classList.toggle("active", state.live);
       updateScrollbar();
       // Throttle (not debounce) so the graphs scroll live while dragging.
-      const now = Date.now();
       if (now - lastRefresh >= 60) {
         lastRefresh = now;
         refreshAll();
       }
     };
+
     apply(e.clientX);
-    const onMove = (ev: PointerEvent) => apply(ev.clientX);
+
+    const onMove = (ev: PointerEvent) => {
+      const delta = Math.abs(ev.clientX - lastX);
+      lastX = ev.clientX;
+      // Sustained fine movement (<=2px) for 250ms unlocks precise (un-snapped) placement.
+      if (!preciseMode) {
+        if (delta <= 2) {
+          if (!fineTimer) {
+            fineTimer = window.setTimeout(() => {
+              preciseMode = true;
+              fineTimer = 0;
+              apply(lastClientX);
+            }, 250);
+          }
+        } else if (fineTimer) {
+          clearTimeout(fineTimer);
+          fineTimer = 0;
+        }
+      }
+      apply(ev.clientX);
+    };
     const onUp = () => {
+      if (fineTimer) clearTimeout(fineTimer);
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
       refreshAll(); // settle on the final position
@@ -567,6 +661,15 @@ function updateScrollbar(): void {
   const frac = denom <= 0 ? 1 : Math.min(1, Math.max(0, (currentWindow().to - minEnd) / denom));
   thumb.style.width = `${thumbW}px`;
   thumb.style.transform = `translateX(${frac * maxLeft}px)`;
+
+  // Date-time readout in the top bar: shows the window while scrubbing/paused, blank when live.
+  const wr = q<HTMLElement>("#window-range");
+  if (state.live && !state.paused) {
+    wr.textContent = "";
+  } else {
+    const w = currentWindow();
+    wr.textContent = `${fmtDateTime(w.from)} – ${fmtDateTime(w.to)}`;
+  }
 }
 
 function setPaused(on: boolean): void {
@@ -1023,8 +1126,19 @@ async function refreshBounds(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // Mark the dev instance so it's easy to tell apart from the real collector.
+  if ((import.meta as { env?: { DEV?: boolean } }).env?.DEV) {
+    const b = document.createElement("span");
+    b.className = "dev-badge";
+    b.textContent = "DEV";
+    document.querySelector(".topbar")?.prepend(b);
+    document.title = "Speed Daemon (dev)";
+  }
+
   const cfg = await invoke<AppConfig>("get_config");
   profiles = new Map(cfg.tags.map((t) => [t.tag, t]));
+  themeSetting = cfg.theme || "system";
+  applyTheme();
 
   buildControls();
   populateTagOptions();

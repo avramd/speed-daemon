@@ -71,6 +71,10 @@ fn tags_are_legacy(tags: &[TagProfile]) -> bool {
 }
 
 pub fn save(path: &Path, cfg: &AppConfig) -> anyhow::Result<()> {
+    // Read-only (dev viewer) mode never writes config — it shares the real instance's files.
+    if std::env::var("SPEED_DAEMON_READONLY").is_ok() {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -127,5 +131,6 @@ pub fn default_config() -> AppConfig {
         tags,
         node: NodeInfo::default(),
         peers: Vec::new(),
+        theme: "system".into(),
     }
 }

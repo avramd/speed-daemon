@@ -22,12 +22,20 @@ export interface TagProfile {
   terrible: number;
 }
 
-const BG = "#0d1117";
-const GREY = "#2a2f37"; // "app wasn't running"
+let BG = "#0d1117";
+let GREY = "#2a2f37"; // "app wasn't running"
 const GREEN = "#3fb950";
 const YELLOW = "#d4c531";
 const ORANGE = "#db8b2a";
 const RED = "#e5484d";
+
+/// Pull theme-dependent colors (strip background, grey gap) from CSS variables.
+/// Call on startup and whenever the theme changes.
+export function refreshPalette(): void {
+  const s = getComputedStyle(document.documentElement);
+  BG = s.getPropertyValue("--strip-bg").trim() || BG;
+  GREY = s.getPropertyValue("--grey").trim() || GREY;
+}
 
 export function bandColor(rtt: number, p: TagProfile): string {
   if (rtt <= p.good) return GREEN;

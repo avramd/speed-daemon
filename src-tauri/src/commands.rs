@@ -146,6 +146,17 @@ pub fn set_tags(cfg: State<Arc<ConfigState>>, tags: Vec<TagProfile>) -> Result<A
     Ok(guard.clone())
 }
 
+#[tauri::command]
+pub fn set_theme(cfg: State<Arc<ConfigState>>, theme: String) -> Result<AppConfig, String> {
+    let mut guard = cfg.config.lock().unwrap();
+    guard.theme = match theme.as_str() {
+        "light" | "dark" => theme,
+        _ => "system".into(),
+    };
+    save(&cfg, &guard)?;
+    Ok(guard.clone())
+}
+
 // ---- networking ----------------------------------------------------------
 
 #[tauri::command]

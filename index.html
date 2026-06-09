@@ -10,14 +10,13 @@
 
   <body>
     <header class="topbar">
-      <h1>speed&middot;daemon</h1>
       <form id="add-form" class="add-form">
         <input id="f-label" placeholder="label" size="10" />
         <input id="f-host" placeholder="host or IP" size="16" required />
         <input id="f-tag" placeholder="tag" size="8" list="tag-options" />
         <button type="submit">add</button>
       </form>
-      <span class="topbar-spacer"></span>
+      <span id="window-range" class="window-range"></span>
       <span id="mode-badge" class="mode-badge">client</span>
       <button id="net-btn" class="icon-btn" title="Network">🛰</button>
       <button id="settings-btn" class="icon-btn" title="Thresholds">⚙</button>
@@ -76,7 +75,14 @@
     <!-- thresholds settings pop-up -->
     <div id="settings" class="modal" hidden>
       <div class="dialog wide">
-        <h2>Response-time thresholds (ms)</h2>
+        <h2>Settings</h2>
+        <div class="theme-row">
+          <span>Theme</span>
+          <label><input type="radio" name="theme" value="system" /> System</label>
+          <label><input type="radio" name="theme" value="light" /> Light</label>
+          <label><input type="radio" name="theme" value="dark" /> Dark</label>
+        </div>
+        <h3 class="sub">Response-time thresholds (ms)</h3>
         <div class="thresh-grid">
           <span></span>
           <span class="th-head">good</span>

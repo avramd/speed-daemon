@@ -64,6 +64,10 @@ pub struct Peer {
     pub addr: Option<String>,
 }
 
+fn default_theme() -> String {
+    "system".into()
+}
+
 /// Whole persisted configuration: probe targets + tag expectation profiles + networking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -73,6 +77,9 @@ pub struct AppConfig {
     pub node: NodeInfo,
     #[serde(default)]
     pub peers: Vec<Peer>,
+    /// "system" (default), "light", or "dark".
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 /// One measurement. `rtt_ms == None` means no response (loss) — rendered as a gap.

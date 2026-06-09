@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Control a read-only dev instance of Speed Daemon that shares the real instance's
+# config + history DB (so it shows your real targets/history) but never polls, writes,
+# or networks. Leave `start` running; use `hide`/`show` to keep it out of your way while
+# Claude churns it — hidden state survives the dev server's rebuild-relaunches.
+#
+# `hide` uses the macOS application hide, so you can bring it back with ⌘-tab, a Dock
+# click, or LaunchBar/`open` — all unhide it natively (no need to run `show`).
+#
+#   bin/dev-mode start     # launch (read-only, shared data) in the background
+#   bin/dev-mode hide      # hide the app (⌘-tab / LaunchBar / Dock will unhide it)
+#   bin/dev-mode show      # reveal + focus it
+#   bin/dev-mode status    # running? hidden?
+#   bin/dev-mode restart   # stop then start
+#   bin/dev-mode stop      # stop the dev server + window
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FLAG="/tmp/speed-daemon-dev.hidden"
+LOG="/tmp/speed-daemon-dev.log"
+TOOLCHAIN="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin"
+
+running() {
+  pgrep -f "target/debug/speed-daemon" >/dev/null 2>&1 \
+    || pgrep -f "$ROOT/node_modules/.bin/tauri" >/dev/null 2>&1
+}
+
+start() {
+  if running; then echo "dev already running (status: $(state))"; return 0; fi
+  rm -f "$FLAG"   # show by default on a fresh start
+  echo "starting dev viewer (read-only, shared data)…  logs: $LOG"
+  cd "$ROOT"
+  SPEED_DAEMON_READONLY=1 PATH="$TOOLCHAIN:$PATH" \
+    nohup npm run tauri dev >"$LOG" 2>&1 &
+  disown || true
+  echo "first launch compiles (~1-2 min), then the window opens."
+}
+
+stop() {
+  echo "stopping dev…"
+  pkill -f "$ROOT/node_modules/.bin/tauri" 2>/dev/null || true
+  pkill -f "$ROOT/node_modules/.bin/vite" 2>/dev/null || true
+  pkill -f "target/debug/speed-daemon" 2>/dev/null || true
+}
+
+state() { [ -f "$FLAG" ] && echo "hidden" || echo "shown"; }
+
+case "${1:-}" in
+  start)        start ;;
+  stop)         stop ;;
+  restart|reload) stop; sleep 1; start ;;
+  hide)         touch "$FLAG"; echo "hidden (stays hidden across rebuilds until 'show')" ;;
+  show)         rm -f "$FLAG"; echo "shown" ;;
+  status)       echo "dev: $(running && echo running || echo stopped); window: $(state)" ;;
+  *)            echo "usage: bin/dev-mode {start|stop|restart|hide|show|status}"; exit 1 ;;
+esac

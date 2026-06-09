@@ -23,21 +23,29 @@ pub struct Db {
 }
 
 impl Db {
-    pub fn open(path: &Path) -> rusqlite::Result<Db> {
+    /// Open the history DB. In `readonly` mode (dev viewer sharing the real instance's
+    /// files) it creates no schema, starts no uptime session, and never writes — it just
+    /// reads the live-growing history alongside the real collector.
+    pub fn open(path: &Path, readonly: bool) -> rusqlite::Result<Db> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             CREATE TABLE IF NOT EXISTS samples (target_id TEXT NOT NULL, ts INTEGER NOT NULL, rtt REAL);
-             CREATE INDEX IF NOT EXISTS idx_samples ON samples(target_id, ts);
-             CREATE TABLE IF NOT EXISTS uptime (start INTEGER NOT NULL, last INTEGER NOT NULL);",
-        )?;
-        let now = now_ms() as i64;
-        conn.execute("INSERT INTO uptime (start, last) VALUES (?1, ?1)", [now])?;
-        let session = conn.last_insert_rowid();
+        conn.execute_batch("PRAGMA busy_timeout=3000;")?;
+        let session = if readonly {
+            -1
+        } else {
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA synchronous=NORMAL;
+                 CREATE TABLE IF NOT EXISTS samples (target_id TEXT NOT NULL, ts INTEGER NOT NULL, rtt REAL);
+                 CREATE INDEX IF NOT EXISTS idx_samples ON samples(target_id, ts);
+                 CREATE TABLE IF NOT EXISTS uptime (start INTEGER NOT NULL, last INTEGER NOT NULL);",
+            )?;
+            let now = now_ms() as i64;
+            conn.execute("INSERT INTO uptime (start, last) VALUES (?1, ?1)", [now])?;
+            conn.last_insert_rowid()
+        };
         Ok(Db {
             conn: Mutex::new(conn),
             session,

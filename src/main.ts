@@ -67,6 +67,12 @@ let profiles = new Map<string, TagProfile>();
 let lastLiveRefresh = 0;
 let editingId: string | null = null;
 
+// Custom stats window: offsets (ms) back from the view's right edge. Because it's relative
+// to `to`, it slides with "now" while live and freezes when paused (pause freezes `to`).
+let selection: { start: number; end: number } | null = null; // start > end
+let selDragging = false;
+let selOverlay: HTMLElement | null = null;
+
 const rowsEl = document.querySelector<HTMLElement>("#rows")!;
 const modal = document.querySelector<HTMLElement>("#editor")!;
 const settingsModal = document.querySelector<HTMLElement>("#settings")!;
@@ -201,18 +207,21 @@ function liveIntervalMs(): number {
 
 async function refreshRow(row: Row): Promise<void> {
   const { from, to } = currentWindow();
+  const sel = selectionWindow(); // stats reflect the custom selection when active
+  const sFrom = sel ? sel.from : from;
+  const sTo = sel ? sel.to : to;
   const n = Math.max(1, Math.floor(row.canvas.clientWidth));
   const id = row.target.id;
   try {
     const [buckets, stats] = await Promise.all([
       invoke<Bucket[]>("get_window", { targetId: id, from, to, buckets: n }),
-      invoke<WindowStats>("get_stats", { targetId: id, from, to }),
+      invoke<WindowStats>("get_stats", { targetId: id, from: sFrom, to: sTo }),
     ]);
     const profile = profileFor(row.target.tag);
     row.buckets = buckets;
     drawBuckets(row.canvas, buckets, profile);
 
-    row.avgEl.textContent = fmtMs(stats.avg);
+    row.avgEl.textContent = stats.avg == null ? "—" : `${fmtMs(stats.avg)}ms`;
     row.avgEl.style.color = stats.avg == null ? "" : bandColor(stats.avg, profile);
     row.jitEl.textContent = stats.jitter == null ? "—" : `±${fmtMs(stats.jitter)}`;
     row.lossEl.textContent = fmtLoss(stats.lossPct);
@@ -224,6 +233,7 @@ async function refreshRow(row: Row): Promise<void> {
 
 async function refreshAll(): Promise<void> {
   updateScrollbar();
+  updateSelectionOverlay();
   await Promise.all([...rows.values()].map(refreshRow));
   if (hoverX != null) updateCrosshairAt(hoverX); // keep readout on the data under the cursor
 }
@@ -265,28 +275,22 @@ function buildRow(target: Target): Row {
   meta.append(chip, labelEl, detailEl);
   meta.addEventListener("click", () => openEditor(target.id));
 
-  // ---- window stats column (avg / jitter / loss) ----
+  // ---- window stats: three columns (avg ms / jitter ±σ / loss %); labels via hover ----
   const wstats = document.createElement("div");
   wstats.className = "wstats";
   const avgEl = document.createElement("span");
-  avgEl.className = "val";
+  avgEl.className = "val s-avg";
+  avgEl.title = "avg response time";
   avgEl.textContent = "—";
   const jitEl = document.createElement("span");
-  jitEl.className = "val";
+  jitEl.className = "val s-jit";
+  jitEl.title = "jitter (1σ from mean)";
   jitEl.textContent = "—";
   const lossEl = document.createElement("span");
-  lossEl.className = "val";
+  lossEl.className = "val s-loss";
+  lossEl.title = "packet loss";
   lossEl.textContent = "0%";
-  const statLine = (k: string, v: HTMLElement) => {
-    const line = document.createElement("div");
-    line.className = "wline";
-    const key = document.createElement("span");
-    key.className = "k";
-    key.textContent = k;
-    line.append(key, v);
-    return line;
-  };
-  wstats.append(statLine("avg", avgEl), statLine("jit", jitEl), statLine("loss", lossEl));
+  wstats.append(avgEl, jitEl, lossEl);
 
   const canvas = document.createElement("canvas");
   canvas.className = "strip";
@@ -548,6 +552,8 @@ function buildControls(): void {
     btn.textContent = r.key;
     btn.addEventListener("click", () => {
       state.rangeSec = r.sec;
+      selection = null; // a selection's offsets don't carry meaning across ranges
+      updateSelectionOverlay();
       rangeWrap.querySelectorAll(".range").forEach((b) => b.classList.toggle("active", b === btn));
       refreshAll();
     });
@@ -662,9 +668,12 @@ function updateScrollbar(): void {
   thumb.style.width = `${thumbW}px`;
   thumb.style.transform = `translateX(${frac * maxLeft}px)`;
 
-  // Date-time readout in the top bar: shows the window while scrubbing/paused, blank when live.
+  // Top-bar readout: selection range if active, else the scrub/paused window, blank when live.
   const wr = q<HTMLElement>("#window-range");
-  if (state.live && !state.paused) {
+  const sw = selectionWindow();
+  if (sw) {
+    wr.textContent = `sel ${fmtDateTime(sw.from)} – ${fmtDateTime(sw.to)}`;
+  } else if (state.live && !state.paused) {
     wr.textContent = "";
   } else {
     const w = currentWindow();
@@ -743,6 +752,7 @@ function wireCrosshair(): void {
   document.body.append(crosshairLine);
 
   rowsEl.addEventListener("pointermove", (e) => {
+    if (selDragging) return; // selection drag owns the pointer
     hoverX = e.clientX;
     updateCrosshairAt(hoverX);
   });
@@ -1062,22 +1072,23 @@ function remoteRowEl(n: RNode): HTMLElement {
 
   const wrap = document.createElement("div");
   wrap.className = "wstats";
-  const line = (k: string, text: string, color: string) => {
-    const l = document.createElement("div");
-    l.className = "wline";
-    const ke = document.createElement("span");
-    ke.className = "k";
-    ke.textContent = k;
+  const mk = (cls: string, text: string, color: string, title: string) => {
     const v = document.createElement("span");
-    v.className = "val";
+    v.className = `val ${cls}`;
+    v.title = title;
     v.textContent = text;
     if (color) v.style.color = color;
-    l.append(ke, v);
-    return l;
+    return v;
   };
   wrap.append(
-    line("avg", fmtMs(n.rttMs), n.rttMs == null ? "" : bandColor(n.rttMs, profile)),
-    line("loss", fmtLoss(n.lossPct), lossColor(n.lossPct)),
+    mk(
+      "s-avg",
+      n.rttMs == null ? "—" : `${fmtMs(n.rttMs)}ms`,
+      n.rttMs == null ? "" : bandColor(n.rttMs, profile),
+      "avg response time",
+    ),
+    mk("s-jit", "—", "", "jitter (not reported by clients)"),
+    mk("s-loss", fmtLoss(n.lossPct), lossColor(n.lossPct), "packet loss"),
   );
 
   const canvas = document.createElement("canvas");
@@ -1114,6 +1125,102 @@ function wireRemote(): void {
   listen<RemoteEvent>("net-remote", (e) => onRemote(e.payload));
 }
 
+// ---- custom selection window ---------------------------------------------
+
+function firstStripRect(): DOMRect | null {
+  const r = rows.values().next().value as Row | undefined;
+  if (!r) return null;
+  const rect = r.canvas.getBoundingClientRect();
+  return rect.width > 0 ? rect : null;
+}
+
+// Map a viewport X within the strips to an absolute time, clamped to the window ends
+// (so dragging past an end stops at it).
+function timeAtX(clientX: number, rect: DOMRect): number {
+  const xf = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+  const w = currentWindow();
+  return w.from + xf * (w.to - w.from);
+}
+
+// Absolute [from,to] of the selection given the current right edge, or null if inactive.
+function selectionWindow(): { from: number; to: number } | null {
+  if (!selection) return null;
+  const end = currentWindow().to;
+  const rangeMs = state.rangeSec * 1000;
+  const s = Math.min(rangeMs, Math.max(0, selection.start));
+  const e = Math.min(rangeMs, Math.max(0, selection.end));
+  if (s - e < 1000) return null; // collapsed
+  return { from: Math.round(end - s), to: Math.round(end - e) };
+}
+
+function updateSelectionOverlay(): void {
+  if (!selOverlay) return;
+  const sw = selectionWindow();
+  const ref = firstStripRect();
+  if (!sw || !ref) {
+    selOverlay.hidden = true;
+    return;
+  }
+  const w = currentWindow();
+  const span = Math.max(1, w.to - w.from);
+  const xA = ref.left + ((sw.from - w.from) / span) * ref.width;
+  const xB = ref.left + ((sw.to - w.from) / span) * ref.width;
+  const rrect = rowsEl.getBoundingClientRect();
+  selOverlay.style.left = `${xA}px`;
+  selOverlay.style.width = `${Math.max(1, xB - xA)}px`;
+  selOverlay.style.top = `${rrect.top}px`;
+  selOverlay.style.height = `${rrect.height}px`;
+  selOverlay.hidden = false;
+}
+
+function wireSelection(): void {
+  selOverlay = document.createElement("div");
+  selOverlay.className = "selection";
+  selOverlay.hidden = true;
+  document.body.append(selOverlay);
+
+  rowsEl.addEventListener("pointerdown", (e) => {
+    if ((e.target as HTMLElement).tagName !== "CANVAS") return; // only the graph area
+    const ref = firstStripRect();
+    if (!ref) return;
+    e.preventDefault();
+    selDragging = true;
+    let moved = false;
+    let last = 0;
+    const anchorT = timeAtX(e.clientX, ref);
+
+    const onMove = (ev: PointerEvent) => {
+      moved = true;
+      const r = firstStripRect();
+      if (!r) return;
+      const curT = timeAtX(ev.clientX, r);
+      const end = currentWindow().to;
+      selection = {
+        start: end - Math.min(anchorT, curT),
+        end: end - Math.max(anchorT, curT),
+      };
+      updateSelectionOverlay();
+      const now = Date.now();
+      if (now - last >= 80) {
+        last = now;
+        refreshAll();
+      }
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      selDragging = false;
+      if (!moved) {
+        selection = null; // a plain click clears the selection
+        updateSelectionOverlay();
+      }
+      refreshAll();
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+  });
+}
+
 // ---- bootstrap -----------------------------------------------------------
 
 async function refreshBounds(): Promise<void> {
@@ -1146,6 +1253,7 @@ async function main(): Promise<void> {
   wireEditor();
   wireSettings();
   wireCrosshair();
+  wireSelection();
   wireNetwork();
   wireRemote();
   node = await invoke<NodeInfo>("get_node");

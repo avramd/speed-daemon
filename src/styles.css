@@ -272,31 +272,30 @@ body {
 }
 
 .wstats {
-  width: 62px;
-  min-width: 62px;
+  width: 108px;
+  min-width: 108px;
   display: flex;
-  flex-direction: column;
-  justify-content: center;
-  font-size: 11px;
-  line-height: 1.25;
-}
-
-.wline {
-  display: flex;
+  align-items: center;
   gap: 4px;
+  font-size: 11px;
 }
 
-.wline .k {
-  color: var(--stat-key);
-  width: 26px;
-  text-align: right;
-  flex: none;
-}
-
-.wline .val {
+.wstats .val {
   font-variant-numeric: tabular-nums;
   color: var(--text);
   font-weight: 600;
+  text-align: right;
+}
+
+/* widths sized to max content: "9999ms" / "±999" / "100%" */
+.wstats .s-avg {
+  width: 44px;
+}
+.wstats .s-jit {
+  width: 28px;
+}
+.wstats .s-loss {
+  width: 28px;
 }
 
 .strip {
@@ -348,6 +347,16 @@ h3.sub {
   font-weight: 600;
   color: var(--muted);
   margin: 4px 0 8px;
+}
+
+/* ---- custom selection window ---- */
+.selection {
+  position: fixed;
+  background: rgba(31, 111, 235, 0.14);
+  border-left: 1px solid var(--accent);
+  border-right: 1px solid var(--accent);
+  pointer-events: none;
+  z-index: 3;
 }
 
 /* ---- hover crosshair ---- */

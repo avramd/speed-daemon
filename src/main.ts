@@ -162,13 +162,34 @@ function snapEnd(end: number): number {
   const local = end - offMs;
   return Math.round(local / step) * step + offMs;
 }
-function fmtDateTime(ms: number): string {
-  return new Date(ms).toLocaleString([], {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+// Range label that drops components shared by start and end:
+//   same day & hour  -> "Jun 18 at 10:42-57 am"
+//   same day         -> "Jun 18 at 10:42am – 11:42am"
+//   same month       -> "Jun 18-19 at 11:45pm – 12:45am"
+//   otherwise        -> "Jun 30 at 11:45pm – Jul 1 at 12:45am"
+function fmtRange(fromMs: number, toMs: number): string {
+  const a = new Date(fromMs);
+  const b = new Date(toMs);
+  const two = (n: number) => String(n).padStart(2, "0");
+  const ap = (h: number) => (h < 12 ? "am" : "pm");
+  const h12 = (h: number) => h % 12 || 12;
+  const date = (d: Date) => d.toLocaleDateString([], { month: "short", day: "numeric" });
+  const time = (d: Date) => `${h12(d.getHours())}:${two(d.getMinutes())}${ap(d.getHours())}`;
+
+  const sameDay = a.toDateString() === b.toDateString();
+  const sameMonth = a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
+
+  if (sameDay && a.getHours() === b.getHours()) {
+    return `${date(a)} at ${h12(a.getHours())}:${two(a.getMinutes())}-${two(b.getMinutes())} ${ap(a.getHours())}`;
+  }
+  if (sameDay) {
+    return `${date(a)} at ${time(a)} – ${time(b)}`;
+  }
+  if (sameMonth) {
+    const month = a.toLocaleDateString([], { month: "short" });
+    return `${month} ${a.getDate()}-${b.getDate()} at ${time(a)} – ${time(b)}`;
+  }
+  return `${date(a)} at ${time(a)} – ${date(b)} at ${time(b)}`;
 }
 
 // Secondary identifier, with nothing repeated: show host only if it differs from the
@@ -672,12 +693,12 @@ function updateScrollbar(): void {
   const wr = q<HTMLElement>("#window-range");
   const sw = selectionWindow();
   if (sw) {
-    wr.textContent = `sel ${fmtDateTime(sw.from)} – ${fmtDateTime(sw.to)}`;
+    wr.textContent = `sel ${fmtRange(sw.from, sw.to)}`;
   } else if (state.live && !state.paused) {
     wr.textContent = "";
   } else {
     const w = currentWindow();
-    wr.textContent = `${fmtDateTime(w.from)} – ${fmtDateTime(w.to)}`;
+    wr.textContent = fmtRange(w.from, w.to);
   }
 }
 

@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Build and install Speed Daemon into /Applications with minimal polling downtime.
+#
+# The slow parts (compile + copy) run while the currently-installed app keeps polling.
+# Only the final swap (quit old -> rename new into place -> relaunch) is downtime — a few
+# seconds, which shows as a grey "app down" gap in the history.
+#
+#   bin/deploy              # build, stage, then fast-swap into /Applications
+#   bin/deploy --swap-only  # skip the build; swap in whatever's already built
+#   bin/deploy --build-only # build only; print the .app/.dmg paths, install nothing
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TOOLCHAIN="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin"
+APP="/Applications/Speed Daemon.app"
+SRC="$ROOT/src-tauri/target/release/bundle/macos/Speed Daemon.app"
+DMG_DIR="$ROOT/src-tauri/target/release/bundle/dmg"
+STAGE="/Applications/.speed-daemon-staging.app"
+POLLER="$HOME/Library/Application Support/org.est.speeddaemon/poller.sem"
+
+# True only if a *handoff-aware* instance is currently polling (so launching alongside it
+# will hand off cleanly). A pre-handoff build has no poller.sem -> fall back to quit+swap.
+handoff_capable() {
+  [ -f "$POLLER" ] || return 1
+  local pid
+  pid=$(awk '{print $1}' "$POLLER" 2>/dev/null)
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+MODE="${1:-deploy}"
+case "$MODE" in
+  deploy | --build-only | --swap-only) ;;
+  *) echo "usage: bin/deploy [--build-only | --swap-only]"; exit 1 ;;
+esac
+
+if [ "$MODE" != "--swap-only" ]; then
+  echo "▸ building release (installed app keeps polling)…"
+  ( cd "$ROOT" && PATH="$TOOLCHAIN:$PATH" npm run tauri build ) || { echo "build failed"; exit 1; }
+fi
+[ -d "$SRC" ] || { echo "no build at: $SRC"; exit 1; }
+
+if [ "$MODE" = "--build-only" ]; then
+  echo "▸ built (not installed):"
+  echo "   app: $SRC"
+  for d in "$DMG_DIR"/*.dmg; do [ -e "$d" ] && echo "   dmg: $d"; done
+  exit 0
+fi
+
+echo "▸ staging new build (no downtime)…"
+rm -rf "$STAGE"
+cp -R "$SRC" "$STAGE"
+
+rm -rf "$APP.prev" 2>/dev/null || true
+if handoff_capable; then
+  # Keep the old instance polling; launch the new one alongside. It takes over via the
+  # handoff semaphores and the old one quits itself — downtime ~1s.
+  echo "▸ swapping in (handoff)…"
+  [ -d "$APP" ] && mv "$APP" "$APP.prev"          # old keeps running from here
+  mv "$STAGE" "$APP"
+  open -n "$APP"
+  echo "▸ new instance launched — it takes over in ~1s, old hands off and quits."
+else
+  # First deploy of the handoff build (old one can't hand off): quick quit + swap.
+  echo "▸ swapping (quit+swap; handoff active from the next deploy)…"
+  osascript -e 'quit app "Speed Daemon"' >/dev/null 2>&1 || true
+  for _ in $(seq 1 25); do
+    pgrep -f "/Applications/Speed Daemon.app/Contents/MacOS/" >/dev/null 2>&1 || break
+    sleep 0.2
+  done
+  rm -rf "$APP"
+  mv "$STAGE" "$APP"
+  open "$APP"
+  echo "▸ deployed."
+fi

@@ -1,6 +1,7 @@
 mod commands;
 mod config;
 mod db;
+mod handoff;
 mod model;
 mod net;
 mod probe;
@@ -31,21 +32,11 @@ fn flag_mtime() -> Option<std::time::SystemTime> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    #[allow(unused_mut)] // `mut` is only used by the release-only cfg block below
-    let mut builder = tauri::Builder::default();
-    // Single-instance only in release builds, so a dev build can run alongside the
-    // installed collector (they share the bundle identifier). A second launch of the
-    // real app focuses the running one (one collector).
-    #[cfg(not(debug_assertions))]
-    {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(w) = app.get_webview_window("main") {
-                let _ = w.show();
-                let _ = w.set_focus();
-            }
-        }));
-    }
-    builder
+    // No single-instance plugin: two instances coexist briefly during a deploy handoff
+    // (only one *polls*, enforced by the handoff semaphores). On macOS a normal relaunch
+    // still just activates the running app; `open -n` (used by bin/deploy) forces the new
+    // instance that triggers the handoff.
+    tauri::Builder::default()
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -67,38 +58,48 @@ pub fn run() {
                 .map(|p| p.join("history.db"))
                 .unwrap_or_else(|| "history.db".into());
             let db = Arc::new(Db::open(&db_path, readonly)?);
-
             let probes = Arc::new(Probes::new());
-            if !readonly {
-                db.prune();
-                for t in &cfg.targets {
-                    let stop = probes.start(&t.id);
-                    probe::spawn_probe(handle.clone(), db.clone(), t.clone(), stop);
-                }
-
-                // Heartbeat (keeps the uptime row fresh) + periodic prune.
-                let hb_db = db.clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut ticks: u64 = 0;
-                    loop {
-                        hb_db.heartbeat();
-                        ticks += 1;
-                        if ticks % 720 == 0 {
-                            hb_db.prune();
-                        }
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                    }
-                });
-            }
-
             let cfg_state = Arc::new(ConfigState {
                 config: Mutex::new(cfg),
                 path: cfg_path,
             });
-
             let net = Net::new(handle.clone(), db.clone(), probes.clone(), cfg_state.clone());
+
             if !readonly {
-                net.start();
+                // Begin probing/networking only once this instance becomes the active
+                // poller (handoff coordinator decides; near-instant takeover on deploy).
+                let h2 = handle.clone();
+                let db2 = db.clone();
+                let probes2 = probes.clone();
+                let cfg2 = cfg_state.clone();
+                let net2 = net.clone();
+                let start_collecting = move || {
+                    db2.prune();
+                    let targets = cfg2.config.lock().unwrap().targets.clone();
+                    for t in targets {
+                        let stop = probes2.start(&t.id);
+                        probe::spawn_probe(h2.clone(), db2.clone(), t, stop);
+                    }
+                    // Uptime heartbeat (keeps the uptime row fresh) + periodic prune.
+                    let hb_db = db2.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let mut ticks: u64 = 0;
+                        loop {
+                            hb_db.heartbeat();
+                            ticks += 1;
+                            if ticks % 720 == 0 {
+                                hb_db.prune();
+                            }
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                        }
+                    });
+                    net2.start();
+                };
+                let sem_dir = db_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                handoff::spawn(handle.clone(), sem_dir, start_collecting);
             }
 
             app.manage(db);

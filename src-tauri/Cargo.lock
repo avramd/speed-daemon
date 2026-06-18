@@ -3407,6 +3407,7 @@ dependencies = [
  "anyhow",
  "gethostname",
  "if-addrs",
+ "libc",
  "rand 0.10.1",
  "rusqlite",
  "serde",

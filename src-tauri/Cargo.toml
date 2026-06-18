@@ -33,4 +33,5 @@ gethostname = "1.1.0"
 if-addrs = "0.15.0"
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-single-instance = "2.4.2"
+libc = "0.2.186"
 

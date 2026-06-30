@@ -17,6 +17,7 @@
         <button type="submit">add</button>
       </form>
       <span id="window-range" class="window-range"></span>
+      <button id="export-csv" class="icon-btn" title="Export the selected window to a CSV in Downloads" hidden>⤓ CSV</button>
       <span id="mode-badge" class="mode-badge">client</span>
       <button id="net-btn" class="icon-btn" title="Network">🛰</button>
       <button id="settings-btn" class="icon-btn" title="Thresholds">⚙</button>
@@ -24,6 +25,15 @@
 
     <div class="controls">
       <div id="ranges" class="ranges"></div>
+      <label class="agg-ctl" title="How each 1px bar reduces the samples it covers">aggregate:
+        <select id="agg-select">
+          <option value="worst">worst</option>
+          <option value="trimmed">trimmed</option>
+          <option value="mean">mean</option>
+          <option value="median">median</option>
+          <option value="best">best</option>
+        </select>
+      </label>
       <div id="scrub" class="scrub" title="Drag to scroll through history">
         <div id="scrub-thumb" class="scrub-thumb"></div>
       </div>
@@ -61,7 +71,7 @@
         <label>Host / IP <input id="m-host" /></label>
         <label>Tag <input id="m-tag" list="tag-options" /></label>
         <label>Delay <span class="unit">ms between probes</span>
-          <input id="m-interval" type="number" min="200" step="100" />
+          <input id="m-interval" type="number" min="1000" step="1000" />
         </label>
         <div class="dialog-actions">
           <button id="m-remove" class="danger" type="button">Remove</button>

@@ -2,12 +2,11 @@ use crate::config;
 use crate::db::Db;
 use crate::model::{AppConfig, Bucket, NodeInfo, Peer, TagProfile, Target, WindowStats};
 use crate::net::Net;
-use crate::probes::Probes;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, State};
+use tauri::State;
 
 /// Live configuration + where it persists. Managed (as `Arc`) so net tasks share it.
 pub struct ConfigState {
@@ -17,6 +16,15 @@ pub struct ConfigState {
 
 fn save(cfg: &ConfigState, c: &AppConfig) -> Result<(), String> {
     config::save(&cfg.path, c).map_err(|e| e.to_string())
+}
+
+/// Tell the running `speedd` daemon to reload config.toml after we changed targets/intervals.
+/// Best-effort: a no-op (harmless error) if the daemon isn't currently loaded.
+fn reload_daemon() {
+    let uid = unsafe { libc::getuid() };
+    let _ = std::process::Command::new("launchctl")
+        .args(["kill", "SIGHUP", &format!("gui/{uid}/org.est.speeddaemon")])
+        .status();
 }
 
 #[tauri::command]
@@ -31,13 +39,54 @@ pub fn get_window(
     from: u64,
     to: u64,
     buckets: usize,
+    agg: String,
 ) -> Vec<Bucket> {
-    db.window(&target_id, from, to, buckets)
+    db.window(&target_id, from, to, buckets, &agg)
 }
 
 #[tauri::command]
 pub fn get_stats(db: State<Arc<Db>>, target_id: String, from: u64, to: u64) -> WindowStats {
     db.stats(&target_id, from, to)
+}
+
+/// The last `limit` raw samples at or before `before` (one Bucket per poll) for the true 1:1
+/// view, where each pixel column is a single ping rather than the worst of a time slice.
+#[tauri::command]
+pub fn get_samples(
+    db: State<Arc<Db>>,
+    target_id: String,
+    before: u64,
+    limit: usize,
+) -> Vec<Bucket> {
+    db.recent(&target_id, before, limit)
+}
+
+/// Export the raw samples in [from, to) as CSV to the user's Downloads folder, then reveal it
+/// in Finder. Returns the saved file path.
+#[tauri::command]
+pub fn export_csv(
+    db: State<Arc<Db>>,
+    cfg: State<Arc<ConfigState>>,
+    from: u64,
+    to: u64,
+) -> Result<String, String> {
+    let targets = cfg.config.lock().unwrap().targets.clone();
+    let csv = db.export_csv(from, to, &targets);
+
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let downloads = PathBuf::from(&home).join("Downloads");
+    let dir = if downloads.is_dir() {
+        downloads
+    } else {
+        PathBuf::from(&home)
+    };
+    let path = dir.join(format!("speed-daemon_{}-{}.csv", from / 1000, to / 1000));
+    std::fs::write(&path, csv).map_err(|e| e.to_string())?;
+
+    // Reveal in Finder (best-effort; the saved path is returned regardless).
+    let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -46,65 +95,39 @@ pub fn get_bounds(db: State<Arc<Db>>) -> u64 {
 }
 
 #[tauri::command]
-pub fn add_target(
-    app: AppHandle,
-    db: State<Arc<Db>>,
-    probes: State<Arc<Probes>>,
-    cfg: State<Arc<ConfigState>>,
-    net: State<Arc<Net>>,
-    target: Target,
-) -> Result<AppConfig, String> {
+pub fn add_target(cfg: State<Arc<ConfigState>>, target: Target) -> Result<AppConfig, String> {
     let result = {
         let mut guard = cfg.config.lock().unwrap();
         if guard.targets.iter().any(|t| t.id == target.id) {
             return Err(format!("target id '{}' already exists", target.id));
         }
-        guard.targets.push(target.clone());
+        guard.targets.push(target);
         save(&cfg, &guard)?;
         guard.clone()
     };
-    let stop = probes.start(&target.id);
-    crate::probe::spawn_probe(app, db.inner().clone(), target, stop);
-    net.reassign_all();
+    reload_daemon();
     Ok(result)
 }
 
 #[tauri::command]
-pub fn update_target(
-    app: AppHandle,
-    db: State<Arc<Db>>,
-    probes: State<Arc<Probes>>,
-    cfg: State<Arc<ConfigState>>,
-    net: State<Arc<Net>>,
-    target: Target,
-) -> Result<AppConfig, String> {
-    let (result, needs_restart) = {
+pub fn update_target(cfg: State<Arc<ConfigState>>, target: Target) -> Result<AppConfig, String> {
+    let result = {
         let mut guard = cfg.config.lock().unwrap();
-        let needs_restart = match guard.targets.iter().find(|t| t.id == target.id) {
-            Some(old) => old.host != target.host || old.interval_ms != target.interval_ms,
-            None => true,
-        };
         match guard.targets.iter_mut().find(|t| t.id == target.id) {
-            Some(slot) => *slot = target.clone(),
-            None => guard.targets.push(target.clone()),
+            Some(slot) => *slot = target,
+            None => guard.targets.push(target),
         }
         save(&cfg, &guard)?;
-        (guard.clone(), needs_restart)
+        guard.clone()
     };
-    if needs_restart {
-        probes.stop(&target.id);
-        let stop = probes.start(&target.id);
-        crate::probe::spawn_probe(app, db.inner().clone(), target, stop);
-    }
-    net.reassign_all();
+    // speedd re-reads every target on SIGHUP, so any host/interval change just takes effect.
+    reload_daemon();
     Ok(result)
 }
 
 #[tauri::command]
 pub fn remove_target(
-    probes: State<Arc<Probes>>,
     cfg: State<Arc<ConfigState>>,
-    net: State<Arc<Net>>,
     target_id: String,
 ) -> Result<AppConfig, String> {
     let result = {
@@ -113,8 +136,7 @@ pub fn remove_target(
         save(&cfg, &guard)?;
         guard.clone()
     };
-    probes.stop(&target_id);
-    net.reassign_all();
+    reload_daemon();
     Ok(result)
 }
 
@@ -152,6 +174,17 @@ pub fn set_theme(cfg: State<Arc<ConfigState>>, theme: String) -> Result<AppConfi
     guard.theme = match theme.as_str() {
         "light" | "dark" => theme,
         _ => "system".into(),
+    };
+    save(&cfg, &guard)?;
+    Ok(guard.clone())
+}
+
+#[tauri::command]
+pub fn set_aggregate(cfg: State<Arc<ConfigState>>, aggregate: String) -> Result<AppConfig, String> {
+    let mut guard = cfg.config.lock().unwrap();
+    guard.aggregate = match aggregate.as_str() {
+        "best" | "trimmed" | "mean" | "median" => aggregate,
+        _ => "worst".into(),
     };
     save(&cfg, &guard)?;
     Ok(guard.clone())

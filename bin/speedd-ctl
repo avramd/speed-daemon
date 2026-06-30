@@ -1,0 +1,114 @@
+#!/bin/bash
+# speedd-ctl — build, install, and control the Speed Daemon poller (speedd) under launchd.
+#
+# speedd is the headless poller. It runs as a per-user LaunchAgent (no root needed; runs in
+# your login session so Wi-Fi is available). It reads config.toml and writes history.db in the
+# data dir, which the GUI shares. SIGHUP makes it reload the config.
+#
+#   bin/speedd-ctl install     build (release), install the binary + LaunchAgent, start it
+#   bin/speedd-ctl uninstall   stop and remove the LaunchAgent (leaves data + config)
+#   bin/speedd-ctl start|stop  load / unload the agent
+#   bin/speedd-ctl restart     hard restart the running daemon
+#   bin/speedd-ctl reload      SIGHUP -> reload config.toml without dropping samples long
+#   bin/speedd-ctl status      show launchd state / pid / last exit
+#   bin/speedd-ctl logs        tail the daemon log
+#   bin/speedd-ctl build       just (re)build + reinstall the binary
+#
+# Set SPEED_DAEMON_DIR to use an isolated data dir (dev/testing) instead of the default.
+
+set -euo pipefail
+
+LABEL="org.est.speeddaemon"
+DOMAIN="gui/$(id -u)"
+DATA_DIR="${SPEED_DAEMON_DIR:-$HOME/Library/Application Support/org.est.speeddaemon}"
+BIN="$DATA_DIR/speedd"
+LOG="$DATA_DIR/speedd.log"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SRC_TAURI="$(cd "$(dirname "$0")/../src-tauri" && pwd)"
+
+build() {
+    # cargo must be on PATH; fall back to the standard rustup toolchain location.
+    if ! command -v cargo >/dev/null 2>&1; then
+        export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
+    fi
+    ( cd "$SRC_TAURI" && cargo build --release --bin speedd )
+    mkdir -p "$DATA_DIR"
+    # Replace atomically: overwriting a running Mach-O in place invalidates the live process's
+    # code signature and macOS kills it (OS_REASON_CODESIGNING). A rename swaps the directory
+    # entry while the running daemon keeps its old inode until it's restarted onto the new one.
+    cp "$SRC_TAURI/target/release/speedd" "$BIN.new"
+    mv -f "$BIN.new" "$BIN"
+    echo "binary -> $BIN"
+}
+
+write_plist() {
+    mkdir -p "$(dirname "$PLIST")"
+    {
+        cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$BIN</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardErrorPath</key>
+    <string>$LOG</string>
+    <key>StandardOutPath</key>
+    <string>$LOG</string>
+EOF
+        # Carry an isolated data dir into the daemon's env when one is set (dev/testing).
+        if [ -n "${SPEED_DAEMON_DIR:-}" ]; then
+            cat <<EOF
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SPEED_DAEMON_DIR</key>
+        <string>$DATA_DIR</string>
+    </dict>
+EOF
+        fi
+        cat <<EOF
+</dict>
+</plist>
+EOF
+    } > "$PLIST"
+    echo "plist  -> $PLIST"
+}
+
+start()   { launchctl bootstrap "$DOMAIN" "$PLIST"; }
+stop()    { launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true; }
+
+case "${1:-}" in
+    install)
+        build
+        write_plist
+        stop
+        start
+        echo "speedd installed and started"
+        ;;
+    uninstall)
+        stop
+        rm -f "$PLIST"
+        echo "speedd uninstalled (data kept in $DATA_DIR)"
+        ;;
+    start)   start ;;
+    stop)    stop ;;
+    restart) launchctl kickstart -k "$DOMAIN/$LABEL" ;;
+    reload)  launchctl kill SIGHUP "$DOMAIN/$LABEL"; echo "sent SIGHUP (config reload)" ;;
+    status)  launchctl print "$DOMAIN/$LABEL" 2>/dev/null | grep -iE "state =|pid =|last exit" || echo "not loaded" ;;
+    logs)    tail -f "$LOG" ;;
+    build)   build ;;
+    *)
+        echo "usage: $0 {install|uninstall|start|stop|restart|reload|status|logs|build}"
+        exit 1
+        ;;
+esac

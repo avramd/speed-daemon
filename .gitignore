@@ -12,6 +12,9 @@ dist
 dist-ssr
 *.local
 
+# Scratch dir for diagnostics / temp files
+tmp
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

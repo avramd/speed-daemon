@@ -1,10 +1,16 @@
 mod commands;
-mod config;
-mod db;
-mod handoff;
-mod model;
+pub mod config;
+pub mod db;
+pub mod icmp;
+pub mod model;
+pub mod poll;
+// Dormant: the GUI no longer polls (the `speedd` daemon does). These support the shelved
+// distributed-monitoring path and stay compiled until it moves into the daemon.
+#[allow(dead_code)]
 mod net;
+#[allow(dead_code)]
 mod probe;
+#[allow(dead_code)]
 mod probes;
 
 use commands::ConfigState;
@@ -49,70 +55,30 @@ pub fn run() {
             let cfg = config::load_or_default(&cfg_path);
             let _ = config::save(&cfg_path, &cfg);
 
-            // Read-only viewer (dev): share the real instance's files, but don't poll,
-            // write, heartbeat, prune, or run networking — just read the live history.
-            let readonly = std::env::var("SPEED_DAEMON_READONLY").is_ok();
-
+            // The GUI is a read-only client of the `speedd` daemon: speedd owns ALL polling and
+            // writes history.db; we only read it for display and reconfigure speedd (config
+            // file + SIGHUP). Read-only means we never open an uptime session or write samples.
             let db_path = cfg_path
                 .parent()
                 .map(|p| p.join("history.db"))
                 .unwrap_or_else(|| "history.db".into());
-            let db = Arc::new(Db::open(&db_path, readonly)?);
+            let db = Arc::new(Db::open(&db_path, true)?);
             let probes = Arc::new(Probes::new());
             let cfg_state = Arc::new(ConfigState {
                 config: Mutex::new(cfg),
                 path: cfg_path,
             });
+            // `net` (distributed monitoring) is constructed but not started — shelved until it
+            // moves into the daemon. It stays dormant so its commands/UI don't break.
             let net = Net::new(handle.clone(), db.clone(), probes.clone(), cfg_state.clone());
-
-            if !readonly {
-                // Begin probing/networking only once this instance becomes the active
-                // poller (handoff coordinator decides; near-instant takeover on deploy).
-                let h2 = handle.clone();
-                let db2 = db.clone();
-                let probes2 = probes.clone();
-                let cfg2 = cfg_state.clone();
-                let net2 = net.clone();
-                let start_collecting = move || {
-                    db2.prune();
-                    let targets = cfg2.config.lock().unwrap().targets.clone();
-                    for t in targets {
-                        let stop = probes2.start(&t.id);
-                        probe::spawn_probe(h2.clone(), db2.clone(), t, stop);
-                    }
-                    // Uptime heartbeat (keeps the uptime row fresh) + periodic prune.
-                    let hb_db = db2.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let mut ticks: u64 = 0;
-                        loop {
-                            hb_db.heartbeat();
-                            ticks += 1;
-                            if ticks % 720 == 0 {
-                                hb_db.prune();
-                            }
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                        }
-                    });
-                    net2.start();
-                };
-                let sem_dir = db_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                handoff::spawn(handle.clone(), sem_dir, start_collecting);
-            }
 
             app.manage(db);
             app.manage(probes);
             app.manage(cfg_state);
             app.manage(net);
 
-            // Auto-start at login — release builds only, so dev binaries aren't registered.
-            #[cfg(not(debug_assertions))]
-            {
-                use tauri_plugin_autostart::ManagerExt;
-                let _ = handle.autolaunch().enable();
-            }
+            // No autostart for the GUI: it's an on-demand viewer now. The always-on poller is
+            // the `speedd` LaunchAgent (managed by bin/speedd-ctl), not this app.
 
             // Tray icon so the app can live in the background with the window closed.
             let show = MenuItem::with_id(&handle, "show", "Show Speed Daemon", true, None::<&str>)?;
@@ -150,6 +116,10 @@ pub fn run() {
 
             // Closing the window hides it instead of quitting (keep collecting).
             if let Some(win) = handle.get_webview_window("main") {
+                // Paint the webview's native background dark (matching the dark theme) so that
+                // when macOS jettisons the web-content process (after the window's been hidden /
+                // occluded a while), the blank we briefly show is black, not a white flash.
+                let _ = win.set_background_color(Some(tauri::window::Color(13, 17, 23, 255)));
                 #[cfg(debug_assertions)]
                 let _ = win.set_title("Speed Daemon (dev)");
                 let w = win.clone();
@@ -199,6 +169,8 @@ pub fn run() {
             commands::get_config,
             commands::get_window,
             commands::get_stats,
+            commands::get_samples,
+            commands::export_csv,
             commands::get_bounds,
             commands::add_target,
             commands::update_target,
@@ -206,6 +178,7 @@ pub fn run() {
             commands::reorder_targets,
             commands::set_tags,
             commands::set_theme,
+            commands::set_aggregate,
             commands::get_node,
             commands::set_mode,
             commands::set_node_name,

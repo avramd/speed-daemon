@@ -36,6 +36,18 @@ pub fn config_path(app: &tauri::AppHandle) -> tauri::Result<PathBuf> {
     Ok(app.path().app_config_dir()?.join("config.toml"))
 }
 
+/// The data dir holding `config.toml` and `history.db`, resolved WITHOUT Tauri so `speedd` can
+/// find it. `SPEED_DAEMON_DIR` overrides; otherwise it's the macOS app-support dir for our
+/// bundle id — the same path Tauri's `app_config_dir()` returns, so the daemon and the GUI
+/// share the same files.
+pub fn data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SPEED_DAEMON_DIR") {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join("Library/Application Support/org.est.speeddaemon")
+}
+
 pub fn load_or_default(path: &Path) -> AppConfig {
     let mut cfg = match std::fs::read_to_string(path) {
         Ok(s) => match toml::from_str::<AppConfig>(&s) {
@@ -132,5 +144,6 @@ pub fn default_config() -> AppConfig {
         node: NodeInfo::default(),
         peers: Vec::new(),
         theme: "system".into(),
+        aggregate: "worst".into(),
     }
 }

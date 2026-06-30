@@ -68,6 +68,10 @@ fn default_theme() -> String {
     "system".into()
 }
 
+fn default_aggregate() -> String {
+    "worst".into()
+}
+
 /// Whole persisted configuration: probe targets + tag expectation profiles + networking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -80,6 +84,10 @@ pub struct AppConfig {
     /// "system" (default), "light", or "dark".
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// How each pixel-bucket reduces the samples it covers: "worst" (default), "trimmed",
+    /// "mean", "median", or "best".
+    #[serde(default = "default_aggregate")]
+    pub aggregate: String,
 }
 
 /// One measurement. `rtt_ms == None` means no response (loss) — rendered as a gap.

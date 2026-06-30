@@ -1,100 +1,93 @@
 # Speed Daemon
 
-A compact home-network probe dashboard: continuously pings a set of tagged targets
-(LAN hosts, gateway, ISP, internet) and shows a dense per-target strip-chart — 1px columns,
-height = log(RTT), expectation-aware colors, grey where the app wasn't running. Rust core +
-Tauri v2; the probing, SQLite history, and client/server networking all run inside the one
-app process (no separate daemon).
+A compact home-network probe dashboard. A headless background **poller** (`speedd`)
+continuously pings a set of tagged targets (LAN hosts, gateway, ISP, internet) and records
+RTT/loss to a local SQLite database; a separate **viewer app** renders a dense per-target
+strip-chart — 1px columns, height = log(RTT), expectation-aware colors, grey where the poller
+wasn't running.
+
+Rust core + Tauri v2. The probing lives in a small **headless daemon, not the GUI** — and that
+split is deliberate: macOS deprioritizes a GUI process's sockets under Wi-Fi power-save by
+~40ms, which silently inflates every reading. A headless CLI process whose thread blocks in
+`recvmsg` stays in the fast path and measures accurately.
+
+## Architecture
+
+- **`speedd`** — the poller. A headless daemon (one blocking thread per target) managed by
+  launchd. Owns all probing and writes `history.db`. Reloads its config on `SIGHUP`.
+- **Speed Daemon.app** — a read-only viewer/controller. Reads `history.db` to draw; editing
+  targets/thresholds writes `config.toml` and signals `speedd` to reload. It never polls.
 
 ## Requirements
 
 - macOS (Apple Silicon), Xcode Command Line Tools
 - Node + npm
-- Rust (rustup). cargo is expected at
-  `~/.rustup/toolchains/stable-aarch64-apple-darwin/bin` — the scripts add it to `PATH`.
+- Rust (rustup). `cargo` is expected at
+  `~/.rustup/toolchains/stable-aarch64-apple-darwin/bin`; the scripts add it to `PATH`. If it
+  isn't on your shell PATH, prefix commands with
+  `env PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" …`.
 
-## Run / build manually
+## The poller — `bin/speedd-ctl`
+
+Install once. It then runs at every login (a LaunchAgent with `RunAtLoad` + `KeepAlive`: it
+restarts itself if it dies, and comes back after a reboot once you log in — login-start so it
+has your user session's Wi-Fi).
+
+```sh
+bin/speedd-ctl install     # build (release), install the binary + LaunchAgent, start it
+```
+
+Control it:
+
+| Action | Command |
+|---|---|
+| **Pause** (stop polling) | `bin/speedd-ctl stop` |
+| **Resume** | `bin/speedd-ctl start` |
+| **Restart** (kill + relaunch) | `bin/speedd-ctl restart` |
+| Reload config without a gap | `bin/speedd-ctl reload` |
+| Status | `bin/speedd-ctl status` |
+| Tail the log | `bin/speedd-ctl logs` |
+| Rebuild + reinstall the binary | `bin/speedd-ctl build` |
+| Remove the LaunchAgent (keeps data) | `bin/speedd-ctl uninstall` |
+
+`stop` pauses until you `start` again — or until your next login, since the agent auto-loads
+then. For a pause that persists across reboots, use `uninstall` (and `install` to put it back).
+While paused, the viewer shows a grey gap for that stretch.
+
+Set `SPEED_DAEMON_DIR` to run against an isolated data dir (dev/testing).
+
+## The viewer app
 
 ```sh
 npm install
-npm run tauri dev      # run in development (needs cargo on PATH)
+npm run tauri dev      # run the viewer in development
 npm run tauri build    # produce a release .app + .dmg under src-tauri/target/release/bundle/
 ```
 
-If `cargo` isn't on your shell PATH, prefix commands with:
-`env PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" …`
-
-## Deploy to /Applications — `bin/deploy`
+To install or update the Dock app, build it and copy the bundle into place (copy install, so
+no Gatekeeper quarantine prompt):
 
 ```sh
-bin/deploy              # build, stage, then install with ~1s downtime (handoff)
-bin/deploy --swap-only  # skip the build; install an already-built bundle
-bin/deploy --build-only # just build and print the .app/.dmg paths (installs nothing)
+npm run tauri build
+ditto "src-tauri/target/release/bundle/macos/Speed Daemon.app" "/Applications/Speed Daemon.app"
 ```
 
-The compile and copy happen while the currently-installed app keeps polling, so only the
-final swap is downtime. Once a handoff-aware build is installed it uses a **near-zero-downtime
-handoff** (launches the new instance with `open -n`; it takes over in ~1s and the old one
-quits itself). The **first** deploy of the handoff build can't hand off, so `bin/deploy`
-detects that and does a quick quit+swap that one time.
-
-The app installs by copy (not from the DMG), so there's no Gatekeeper quarantine prompt.
-
-## Background app
-
-The release app runs in the background: a menu-bar (tray) icon, hide-on-close (closing the
-window keeps it collecting), autostart at login, and a macOS *reopen* handler so ⌘-tab /
-LaunchBar / Dock / a relaunch bring the window back.
-
-## Dev viewer (no disruption to the real collector) — `bin/dev-mode`
-
-A read-only dev instance shares the installed app's real config + history (so it shows your
-real targets and history) but never polls, writes, or networks.
-
-```sh
-bin/dev-mode start     # launch the read-only viewer (your real data), backgrounded
-bin/dev-mode hide      # macOS-hide it (⌘-tab / LaunchBar / Dock unhide it natively)
-bin/dev-mode show      # reveal + focus it
-bin/dev-mode status    # running? hidden?
-bin/dev-mode restart
-bin/dev-mode stop
-```
-
-The dev window is labeled with a red **DEV** badge and a "(dev)" title. `hide` survives the
-dev server's rebuild-relaunches, so backend churn won't pop a window in front of you.
+It runs in the background with a menu-bar (tray) icon and hide-on-close. It's only a viewer, so
+closing it doesn't stop data collection — `speedd` keeps polling regardless.
 
 ## Data, config, and logs
 
-Stored in the app config dir (override with `SPEED_DAEMON_DIR` for an isolated instance):
+Stored in the app data dir (override with `SPEED_DAEMON_DIR`):
 
 ```
 ~/Library/Application Support/org.est.speeddaemon/
-  config.toml     targets, tag thresholds, node identity/mode, paired peers, theme
+  speedd          the installed poller binary
+  config.toml     targets, tag thresholds, node identity, theme
   history.db      SQLite sample history (WAL), retained ~1 week
-  poller.sem      the active poller's "<pid> <checkin_ms>" (handoff)
-  takeover.sem    a newly-launched instance waiting to take over (handoff)
-  handoff.log     append-only record of every handoff transition (+ echoed to stderr)
+  speedd.log      the daemon's stdout/stderr
 ```
 
-Environment variables:
-- `SPEED_DAEMON_DIR` — use a different data dir (dev isolation).
-- `SPEED_DAEMON_READONLY` — share the real data dir but don't poll/write/network (viewer).
+## Deferred
 
-### Debugging a handoff
-
-`handoff.log` records each transition as `<epoch-ms> pid=<pid> <event>`, e.g.
-`claimed active poller (cold start)`, `waiting to take over from pid 1234`,
-`handing off to pid 5678; releasing and quitting`. Tail it to inspect a handover after the
-fact without reproducing it:
-
-```sh
-tail -f "$HOME/Library/Application Support/org.est.speeddaemon/handoff.log"
-```
-
-## Client / server (distributed monitoring, phase 1)
-
-In the **Network** (🛰) panel, switch a machine to **server** mode to discover clients on the
-LAN (UDP broadcast), invite one (custom message + 5-minute timeout), and — once paired (a
-shared secret is exchanged and checked on every message) — assign it your targets. Clients
-merge assigned hosts into their own probing (de-duping what they already poll) and report
-results every 10s; the server shows them as source-tagged rows with filter/sort.
+Cross-machine/distributed monitoring (the **Network** panel) is shelved while the poller lives
+in `speedd`; that code is dormant and the panel is currently inactive.

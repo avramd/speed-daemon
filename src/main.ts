@@ -14,6 +14,7 @@ interface AppConfig {
   targets: Target[];
   tags: TagProfile[];
   theme?: string;
+  aggregate?: string;
 }
 
 interface SampleEvent {
@@ -60,7 +61,19 @@ const state = {
   oldestMs: Date.now(),
   paused: false,
   frozenTo: Date.now(),
+  oneToOne: false, // window span = strip width in px (one ping per column)
 };
+
+function stripWidthPx(): number {
+  return firstStripRect()?.width ?? 600;
+}
+// Effective range: in 1:1 mode it's the strip width in pixels (≈ seconds at 1 ping/s).
+function curRangeSec(): number {
+  return state.oneToOne ? Math.max(60, Math.floor(stripWidthPx())) : state.rangeSec;
+}
+function rangeMs(): number {
+  return curRangeSec() * 1000;
+}
 
 const rows = new Map<string, Row>();
 let profiles = new Map<string, TagProfile>();
@@ -126,6 +139,9 @@ function lossColor(p: number): string {
   return "#e5484d";
 }
 
+// How each pixel-bucket reduces its samples: worst | trimmed | mean | median | best.
+let aggregate = "worst";
+
 // ---- theme ----
 let themeSetting = "system";
 const themeMql = window.matchMedia("(prefers-color-scheme: dark)");
@@ -156,7 +172,7 @@ const SNAP_MS: Record<number, number> = {
   604800: 6 * 60 * 60_000,
 };
 function snapEnd(end: number): number {
-  const step = SNAP_MS[state.rangeSec];
+  const step = SNAP_MS[curRangeSec()]; // 1:1 (dynamic span) isn't in the table -> no snap
   if (!step) return end;
   const offMs = new Date().getTimezoneOffset() * 60_000; // align in local wall-clock time
   const local = end - offMs;
@@ -167,6 +183,18 @@ function snapEnd(end: number): number {
 //   same day         -> "Jun 18 at 10:42am – 11:42am"
 //   same month       -> "Jun 18-19 at 11:45pm – 12:45am"
 //   otherwise        -> "Jun 30 at 11:45pm – Jul 1 at 12:45am"
+// Compact duration, e.g. "45s", "11m 13s", "1h", "6h", "1d", "7d".
+function fmtDur(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return s % 60 ? `${m}m ${s % 60}s` : `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  return h % 24 ? `${d}d ${h % 24}h` : `${d}d`;
+}
+
 function fmtRange(fromMs: number, toMs: number): string {
   const a = new Date(fromMs);
   const b = new Date(toMs);
@@ -174,12 +202,19 @@ function fmtRange(fromMs: number, toMs: number): string {
   const ap = (h: number) => (h < 12 ? "am" : "pm");
   const h12 = (h: number) => h % 12 || 12;
   const date = (d: Date) => d.toLocaleDateString([], { month: "short", day: "numeric" });
-  const time = (d: Date) => `${h12(d.getHours())}:${two(d.getMinutes())}${ap(d.getHours())}`;
+  // Show seconds for short spans (< 5 min) so a tight selection isn't rounded to the minute.
+  const secs = toMs - fromMs < 5 * 60 * 1000;
+  const time = (d: Date) =>
+    secs
+      ? `${h12(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}${ap(d.getHours())}`
+      : `${h12(d.getHours())}:${two(d.getMinutes())}${ap(d.getHours())}`;
 
   const sameDay = a.toDateString() === b.toDateString();
   const sameMonth = a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth();
 
-  if (sameDay && a.getHours() === b.getHours()) {
+  // The minute-only collapse ("10:42-57 am") can't carry seconds cleanly; skip it when we
+  // need second resolution and fall through to the explicit start – end form below.
+  if (!secs && sameDay && a.getHours() === b.getHours()) {
     return `${date(a)} at ${h12(a.getHours())}:${two(a.getMinutes())}-${two(b.getMinutes())} ${ap(a.getHours())}`;
   }
   if (sameDay) {
@@ -204,8 +239,8 @@ function detailText(target: Target, resolvedIp: string | null): string {
 
 function currentWindow(): { from: number; to: number } {
   const now = Date.now();
-  const rangeMs = state.rangeSec * 1000;
-  const minEnd = state.oldestMs + rangeMs;
+  const rMs = rangeMs();
+  const minEnd = state.oldestMs + rMs;
   let end: number;
   if (state.paused) {
     end = state.frozenTo;
@@ -215,30 +250,74 @@ function currentWindow(): { from: number; to: number } {
     end = minEnd + state.anchorFrac * Math.max(0, now - minEnd);
     end = Math.min(now, Math.max(minEnd, end));
   }
-  return { from: Math.round(end - rangeMs), to: Math.round(end) };
+  return { from: Math.round(end - rMs), to: Math.round(end) };
 }
 
 function liveIntervalMs(): number {
-  if (state.rangeSec <= 43200) return 1000;
-  if (state.rangeSec <= 86400) return 3000;
+  const r = curRangeSec();
+  if (r <= 43200) return 1000;
+  if (r <= 86400) return 3000;
   return 15000;
 }
 
 // ---- rendering -----------------------------------------------------------
 
+// Avg / jitter / loss computed client-side from 1:1 sample buckets — each bar is one poll, so
+// `bucket.worst` IS the raw RTT. Optional [lo, hi) restricts to a drag-selected sub-range.
+function statsFrom1to1(
+  buckets: Bucket[],
+  lo?: number,
+  hi?: number,
+): { avg: number | null; jitter: number | null; lossPct: number } {
+  let sum = 0;
+  let sumSq = 0;
+  let recv = 0;
+  let total = 0;
+  for (const b of buckets) {
+    if (lo != null && hi != null && (b.t < lo || b.t >= hi)) continue;
+    if (b.count === 0) continue;
+    total += b.count;
+    if (b.worst != null) {
+      sum += b.worst;
+      sumSq += b.worst * b.worst;
+      recv += 1;
+    }
+  }
+  if (recv === 0) return { avg: null, jitter: null, lossPct: total > 0 ? 100 : 0 };
+  const avg = sum / recv;
+  const jitter = Math.sqrt(Math.max(0, sumSq / recv - avg * avg));
+  const lossPct = total > 0 ? ((total - recv) / total) * 100 : 0;
+  return { avg, jitter, lossPct };
+}
+
 async function refreshRow(row: Row): Promise<void> {
   const { from, to } = currentWindow();
   const sel = selectionWindow(); // stats reflect the custom selection when active
-  const sFrom = sel ? sel.from : from;
-  const sTo = sel ? sel.to : to;
   const n = Math.max(1, Math.floor(row.canvas.clientWidth));
   const id = row.target.id;
+  const profile = profileFor(row.target.tag);
   try {
-    const [buckets, stats] = await Promise.all([
-      invoke<Bucket[]>("get_window", { targetId: id, from, to, buckets: n }),
-      invoke<WindowStats>("get_stats", { targetId: id, from: sFrom, to: sTo }),
-    ]);
-    const profile = profileFor(row.target.tag);
+    let buckets: Bucket[];
+    let stats: { avg: number | null; jitter: number | null; lossPct: number };
+    if (state.oneToOne) {
+      // True 1:1 — one raw poll per pixel (no time-bucketing), ending at the shown instant.
+      buckets = await invoke<Bucket[]>("get_samples", { targetId: id, before: to, limit: n });
+      stats = statsFrom1to1(buckets, sel?.from, sel?.to);
+    } else {
+      const sFrom = sel ? sel.from : from;
+      const sTo = sel ? sel.to : to;
+      // Never request more buckets than there are seconds in the window: with 1s polling,
+      // sub-second buckets would leave periodic empty columns (a moiré of fake gaps). Capping
+      // at one-per-second keeps every column backed by a sample; drawBuckets stretches them.
+      const windowSecs = Math.max(1, Math.ceil((to - from) / 1000));
+      const nb = Math.min(n, windowSecs);
+      const [b, st] = await Promise.all([
+        invoke<Bucket[]>("get_window", { targetId: id, from, to, buckets: nb, agg: aggregate }),
+        invoke<WindowStats>("get_stats", { targetId: id, from: sFrom, to: sTo }),
+      ]);
+      buckets = b;
+      stats = { avg: st.avg, jitter: st.jitter, lossPct: st.lossPct };
+    }
     row.buckets = buckets;
     drawBuckets(row.canvas, buckets, profile);
 
@@ -393,8 +472,9 @@ async function saveEditor(): Promise<void> {
   const label = q<HTMLInputElement>("#m-label").value.trim();
   const host = q<HTMLInputElement>("#m-host").value.trim();
   const tag = q<HTMLInputElement>("#m-tag").value.trim() || "internet";
+  // 1s floor: one poll per wall-clock second per target (matches the daemon's enforcement).
   const intervalMs = Math.max(
-    200,
+    1000,
     parseInt(q<HTMLInputElement>("#m-interval").value, 10) || 1000,
   );
   if (!host) return;
@@ -565,21 +645,50 @@ async function persistOrder(): Promise<void> {
 
 // ---- controls ------------------------------------------------------------
 
+function updateRangeActive(): void {
+  q<HTMLElement>("#ranges")
+    .querySelectorAll<HTMLElement>(".range")
+    .forEach((b) => {
+      const active = state.oneToOne
+        ? b.dataset.one === "1"
+        : b.dataset.sec !== undefined && Number(b.dataset.sec) === state.rangeSec;
+      b.classList.toggle("active", active);
+    });
+}
+
 function buildControls(): void {
   const rangeWrap = q<HTMLElement>("#ranges");
+  // 1:1 (leftmost) — window span = strip width in px, so each column is one ping.
+  const oneBtn = document.createElement("button");
+  oneBtn.className = "range";
+  oneBtn.textContent = "1:1";
+  oneBtn.dataset.one = "1";
+  oneBtn.title = "One ping per pixel (window = strip width)";
+  oneBtn.addEventListener("click", () => {
+    state.oneToOne = true;
+    selection = null;
+    updateSelectionOverlay();
+    updateRangeActive();
+    refreshAll();
+  });
+  rangeWrap.append(oneBtn);
+
   for (const r of RANGES) {
     const btn = document.createElement("button");
-    btn.className = "range" + (r.sec === state.rangeSec ? " active" : "");
+    btn.className = "range";
     btn.textContent = r.key;
+    btn.dataset.sec = String(r.sec);
     btn.addEventListener("click", () => {
       state.rangeSec = r.sec;
+      state.oneToOne = false;
       selection = null; // a selection's offsets don't carry meaning across ranges
       updateSelectionOverlay();
-      rangeWrap.querySelectorAll(".range").forEach((b) => b.classList.toggle("active", b === btn));
+      updateRangeActive();
       refreshAll();
     });
     rangeWrap.append(btn);
   }
+  updateRangeActive();
 
   const track = q<HTMLElement>("#scrub");
   const liveBtn = q<HTMLButtonElement>("#live-btn");
@@ -604,8 +713,7 @@ function buildControls(): void {
     const apply = (clientX: number) => {
       lastClientX = clientX;
       const now = Date.now();
-      const rangeMs = state.rangeSec * 1000;
-      const minEnd = state.oldestMs + rangeMs;
+      const minEnd = state.oldestMs + rangeMs();
       const span = Math.max(1, now - minEnd);
       const nl = Math.min(geo.maxLeft, Math.max(0, clientX - rect.left - grab));
       const rawFrac = geo.maxLeft > 0 ? nl / geo.maxLeft : 1;
@@ -665,6 +773,38 @@ function buildControls(): void {
   liveBtn.classList.toggle("active", state.live);
 
   q<HTMLButtonElement>("#pause-btn").addEventListener("click", togglePause);
+
+  const exportBtn = q<HTMLButtonElement>("#export-csv");
+  exportBtn.addEventListener("click", async () => {
+    const sw = selectionWindow();
+    if (!sw) return;
+    exportBtn.disabled = true;
+    const label = exportBtn.textContent;
+    try {
+      await invoke<string>("export_csv", { from: sw.from, to: sw.to });
+      exportBtn.textContent = "✓ saved"; // file also reveals in Finder
+    } catch (e) {
+      console.error("export failed", e);
+      exportBtn.textContent = "✗ failed";
+    } finally {
+      window.setTimeout(() => {
+        exportBtn.textContent = label;
+        exportBtn.disabled = false;
+      }, 2000);
+    }
+  });
+
+  const aggSel = q<HTMLSelectElement>("#agg-select");
+  aggSel.value = aggregate;
+  aggSel.addEventListener("change", async (e) => {
+    aggregate = (e.target as HTMLSelectElement).value;
+    try {
+      await invoke("set_aggregate", { aggregate });
+    } catch {
+      /* ignore */
+    }
+    refreshAll(); // re-render every row with the new reduction
+  });
 }
 
 // Scrollbar thumb sizing: width = window / total-data-span, position from anchor.
@@ -672,7 +812,7 @@ function thumbGeometry(): { thumbW: number; maxLeft: number } {
   const track = q<HTMLElement>("#scrub");
   const trackW = track.clientWidth;
   const span = Math.max(1, Date.now() - state.oldestMs);
-  const windowMs = state.rangeSec * 1000;
+  const windowMs = rangeMs();
   const frac = Math.min(1, windowMs / span);
   const thumbW = Math.min(trackW, Math.max(16, frac * trackW));
   const maxLeft = Math.max(0, trackW - thumbW);
@@ -683,22 +823,24 @@ function updateScrollbar(): void {
   const thumb = q<HTMLElement>("#scrub-thumb");
   const { thumbW, maxLeft } = thumbGeometry();
   const now = Date.now();
-  const minEnd = state.oldestMs + state.rangeSec * 1000;
+  const minEnd = state.oldestMs + rangeMs();
   const denom = now - minEnd;
   const frac = denom <= 0 ? 1 : Math.min(1, Math.max(0, (currentWindow().to - minEnd) / denom));
   thumb.style.width = `${thumbW}px`;
   thumb.style.transform = `translateX(${frac * maxLeft}px)`;
 
-  // Top-bar readout: selection range if active, else the scrub/paused window, blank when live.
+  // Top-bar readout: selection (with duration) if active; otherwise the window's real
+  // duration, plus the absolute range when scrubbed/paused.
   const wr = q<HTMLElement>("#window-range");
   const sw = selectionWindow();
+  q<HTMLButtonElement>("#export-csv").hidden = !sw; // only exportable with a selection
   if (sw) {
-    wr.textContent = `sel ${fmtRange(sw.from, sw.to)}`;
+    wr.textContent = `sel ${fmtDur(sw.to - sw.from)} · ${fmtRange(sw.from, sw.to)}`;
   } else if (state.live && !state.paused) {
-    wr.textContent = "";
+    wr.textContent = fmtDur(rangeMs()); // real span (esp. useful in 1:1)
   } else {
     const w = currentWindow();
-    wr.textContent = fmtRange(w.from, w.to);
+    wr.textContent = `${fmtDur(w.to - w.from)} · ${fmtRange(w.from, w.to)}`;
   }
 }
 
@@ -1167,9 +1309,9 @@ function timeAtX(clientX: number, rect: DOMRect): number {
 function selectionWindow(): { from: number; to: number } | null {
   if (!selection) return null;
   const end = currentWindow().to;
-  const rangeMs = state.rangeSec * 1000;
-  const s = Math.min(rangeMs, Math.max(0, selection.start));
-  const e = Math.min(rangeMs, Math.max(0, selection.end));
+  const rMs = rangeMs();
+  const s = Math.min(rMs, Math.max(0, selection.start));
+  const e = Math.min(rMs, Math.max(0, selection.end));
   if (s - e < 1000) return null; // collapsed
   return { from: Math.round(end - s), to: Math.round(end - e) };
 }
@@ -1266,6 +1408,7 @@ async function main(): Promise<void> {
   const cfg = await invoke<AppConfig>("get_config");
   profiles = new Map(cfg.tags.map((t) => [t.tag, t]));
   themeSetting = cfg.theme || "system";
+  aggregate = cfg.aggregate || "worst";
   applyTheme();
 
   buildControls();

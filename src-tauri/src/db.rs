@@ -1,8 +1,18 @@
-use crate::model::{Bucket, WindowStats};
+use crate::model::{Bucket, Target, WindowStats};
 use rusqlite::Connection;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Minimal CSV escaping: quote a field that contains a comma, quote, or newline.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
 
 pub const WEEK_MS: u64 = 7 * 24 * 3600 * 1000;
 
@@ -137,8 +147,18 @@ impl Db {
         }
     }
 
-    /// Aggregate [from, to) into `buckets` equal time slices for one target.
-    pub fn window(&self, target_id: &str, from: u64, to: u64, buckets: usize) -> Vec<Bucket> {
+    /// Aggregate [from, to) into `buckets` equal time slices for one target. `agg` chooses how
+    /// each bucket reduces its samples: "best" (min), "worst" (max), "mean", "median" (the
+    /// higher of the two middles on an even count), or "trimmed" (mean after dropping one
+    /// min and one max; if fewer than 3 values, no trim — plain mean).
+    pub fn window(
+        &self,
+        target_id: &str,
+        from: u64,
+        to: u64,
+        buckets: usize,
+        agg: &str,
+    ) -> Vec<Bucket> {
         let n = buckets.max(1);
         let span = to.saturating_sub(from).max(1);
         let conn = self.conn.lock().unwrap();
@@ -153,16 +173,23 @@ impl Db {
             })
             .collect();
 
-        // Bucket samples: worst (max) RTT, loss fraction, count.
-        if let Ok(mut stmt) = conn.prepare(
+        // Pass 1: loss + count per bucket, plus the value for the simple modes (a NULL-ignoring
+        // SQL aggregate). median/trimmed need ranked values, computed in pass 2 below.
+        let val_expr = match agg {
+            "best" => "MIN(rtt)",
+            "mean" => "AVG(rtt)",
+            _ => "MAX(rtt)", // "worst" (also a harmless placeholder for median/trimmed)
+        };
+        let q = format!(
             "SELECT ((ts - ?1) * ?2 / ?3) AS b, \
-                    MAX(rtt), \
+                    {val_expr}, \
                     SUM(CASE WHEN rtt IS NULL THEN 1 ELSE 0 END), \
                     COUNT(*) \
              FROM samples \
              WHERE target_id = ?4 AND ts >= ?1 AND ts < ?5 \
-             GROUP BY b",
-        ) {
+             GROUP BY b"
+        );
+        if let Ok(mut stmt) = conn.prepare(&q) {
             let rows = stmt.query_map(
                 rusqlite::params![from as i64, n as i64, span as i64, target_id, to as i64],
                 |r| {
@@ -175,11 +202,43 @@ impl Db {
                 },
             );
             if let Ok(rows) = rows {
-                for (b, worst, lost, cnt) in rows.flatten() {
+                for (b, value, lost, cnt) in rows.flatten() {
                     let i = (b.max(0) as usize).min(n - 1);
-                    out[i].worst = worst;
+                    out[i].worst = value;
                     out[i].count = cnt as u32;
                     out[i].loss = if cnt > 0 { lost as f64 / cnt as f64 } else { 0.0 };
+                }
+            }
+        }
+
+        // Pass 2 (median/trimmed only): recompute each bucket's value from its ranked non-null
+        // samples. vcnt = non-null count; rn = 1..vcnt ascending (1 = best, vcnt = worst).
+        if agg == "median" || agg == "trimmed" {
+            let pick = if agg == "median" {
+                "SELECT b, rtt FROM r WHERE rn = vcnt / 2 + 1" // higher-middle on ties
+            } else {
+                "SELECT b, AVG(rtt) FROM r WHERE vcnt < 3 OR (rn > 1 AND rn < vcnt) GROUP BY b"
+            };
+            let bx = "((ts - ?1) * ?2 / ?3)";
+            let q2 = format!(
+                "WITH r AS ( \
+                   SELECT {bx} AS b, rtt, \
+                          ROW_NUMBER() OVER (PARTITION BY {bx} ORDER BY rtt) AS rn, \
+                          COUNT(*) OVER (PARTITION BY {bx}) AS vcnt \
+                   FROM samples \
+                   WHERE target_id = ?4 AND ts >= ?1 AND ts < ?5 AND rtt IS NOT NULL \
+                 ) {pick}"
+            );
+            if let Ok(mut stmt) = conn.prepare(&q2) {
+                let rows = stmt.query_map(
+                    rusqlite::params![from as i64, n as i64, span as i64, target_id, to as i64],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?)),
+                );
+                if let Ok(rows) = rows {
+                    for (b, value) in rows.flatten() {
+                        let i = (b.max(0) as usize).min(n - 1);
+                        out[i].worst = value;
+                    }
                 }
             }
         }
@@ -205,6 +264,103 @@ impl Db {
             }
         }
 
+        out
+    }
+
+    /// The most recent `limit` raw samples at or before `before` for one target, oldest-first,
+    /// one `Bucket` each. The 1:1 view uses this to draw exactly one ping per pixel — no
+    /// time-bucketing, so a bar is a single poll, not the worst RTT of a 1-second slice.
+    pub fn recent(&self, target_id: &str, before: u64, limit: usize) -> Vec<Bucket> {
+        let conn = self.conn.lock().unwrap();
+        let mut out: Vec<Bucket> = Vec::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT ts, rtt FROM samples WHERE target_id = ?1 AND ts <= ?2 \
+             ORDER BY ts DESC LIMIT ?3",
+        ) {
+            let rows = stmt.query_map(
+                rusqlite::params![target_id, before as i64, limit as i64],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?)),
+            );
+            if let Ok(rows) = rows {
+                for (ts, rtt) in rows.flatten() {
+                    out.push(Bucket {
+                        t: ts as u64,
+                        worst: rtt,
+                        loss: if rtt.is_none() { 1.0 } else { 0.0 },
+                        count: 1,
+                        up: true,
+                    });
+                }
+            }
+        }
+        out.reverse(); // query is newest-first; draw oldest -> newest
+        out
+    }
+
+    /// CSV of raw samples in [from, to): one row per wall-clock second that had any poll, one
+    /// column per target (in `targets` order, headed by label). A cell is the first reply's RTT
+    /// (ms) in that second, '!' if the target was polled but got no reply, or blank if it wasn't
+    /// polled that second. (With the 1s poll floor there's normally one poll per second per
+    /// target; if two ever land in one second, the first wins.)
+    pub fn export_csv(&self, from: u64, to: u64, targets: &[Target]) -> String {
+        let conn = self.conn.lock().unwrap();
+        let col: HashMap<&str, usize> = targets
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.id.as_str(), i))
+            .collect();
+
+        // second -> (local "YYYY-MM-DD HH:MM:SS", one cell per target)
+        let mut rows: BTreeMap<i64, (String, Vec<Option<String>>)> = BTreeMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT CAST(ts/1000 AS INTEGER) AS sec, \
+                    datetime(ts/1000, 'unixepoch', 'localtime') AS t, \
+                    target_id, rtt \
+             FROM samples WHERE ts >= ?1 AND ts < ?2 ORDER BY ts",
+        ) {
+            let mapped = stmt.query_map(rusqlite::params![from as i64, to as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                ))
+            });
+            if let Ok(mapped) = mapped {
+                for (sec, t, tid, rtt) in mapped.flatten() {
+                    let c = match col.get(tid.as_str()) {
+                        Some(&c) => c,
+                        None => continue, // sample for a target no longer in the config
+                    };
+                    let entry = rows
+                        .entry(sec)
+                        .or_insert_with(|| (t, vec![None; targets.len()]));
+                    if entry.1[c].is_none() {
+                        entry.1[c] = Some(match rtt {
+                            Some(v) => format!("{v:.1}"),
+                            None => "!".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut out = String::from("time");
+        for t in targets {
+            out.push(',');
+            out.push_str(&csv_field(&t.label));
+        }
+        out.push('\n');
+        for (_sec, (t, cells)) in rows {
+            out.push_str(&csv_field(&t));
+            for cell in cells {
+                out.push(',');
+                if let Some(v) = cell {
+                    out.push_str(&v);
+                }
+            }
+            out.push('\n');
+        }
         out
     }
 }

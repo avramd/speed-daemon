@@ -260,6 +260,14 @@ impl Db {
                     out[i].worst = value;
                     out[i].count = cnt as u32;
                     out[i].loss = if cnt > 0 { lost as f64 / cnt as f64 } else { 0.0 };
+                    // A bucket with samples was necessarily up — mark it so directly, rather than
+                    // waiting for the uptime interval below. The heartbeat only advances `last`
+                    // every 5s, so the newest few seconds would otherwise render grey (not-up)
+                    // even though their samples are already stored — the live 1:1 "gaps that fill
+                    // in together" every heartbeat.
+                    if cnt > 0 {
+                        out[i].up = true;
+                    }
                 }
             }
         }

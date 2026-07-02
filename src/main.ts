@@ -237,9 +237,21 @@ function detailText(target: Target, resolvedIp: string | null): string {
   return parts.join("  ");
 }
 
-function currentWindow(): { from: number; to: number } {
+// Pixels map to buckets, each a WHOLE number of seconds so its boundaries can be pinned to a
+// fixed wall-clock grid. bucketSec is the smallest whole-second size that fits within the strip
+// width; nb buckets then span ~the chosen range.
+function bucketPlan(): { bucketMs: number; nb: number } {
+  const rangeSecs = curRangeSec();
+  const px = Math.max(1, Math.floor(stripWidthPx()));
+  const bucketSec = Math.max(1, Math.ceil(rangeSecs / px));
+  const nb = Math.max(1, Math.round(rangeSecs / bucketSec));
+  return { bucketMs: bucketSec * 1000, nb };
+}
+
+function currentWindow(): { from: number; to: number; nb: number; bucketMs: number } {
   const now = Date.now();
   const rMs = rangeMs();
+  const { bucketMs, nb } = bucketPlan();
   const minEnd = state.oldestMs + rMs;
   let end: number;
   if (state.paused) {
@@ -250,92 +262,67 @@ function currentWindow(): { from: number; to: number } {
     end = minEnd + state.anchorFrac * Math.max(0, now - minEnd);
     end = Math.min(now, Math.max(minEnd, end));
   }
-  return { from: Math.round(end - rMs), to: Math.round(end) };
-}
-
-function liveIntervalMs(): number {
-  const r = curRangeSec();
-  if (r <= 43200) return 1000;
-  if (r <= 86400) return 3000;
-  return 15000;
+  // Pin the window's right edge (and thus every bucket boundary) to the bucketMs grid, so as
+  // `now` advances within a bucket nothing changes — the view only moves in whole-bucket steps,
+  // and each bar keeps aggregating the exact same wall-clock interval (no shimmer/morph).
+  const to = Math.floor(end / bucketMs) * bucketMs;
+  const from = to - nb * bucketMs;
+  return { from, to, nb, bucketMs };
 }
 
 // ---- rendering -----------------------------------------------------------
 
-// Avg / jitter / loss computed client-side from 1:1 sample buckets — each bar is one poll, so
-// `bucket.worst` IS the raw RTT. Optional [lo, hi) restricts to a drag-selected sub-range.
-function statsFrom1to1(
-  buckets: Bucket[],
-  lo?: number,
-  hi?: number,
-): { avg: number | null; jitter: number | null; lossPct: number } {
-  let sum = 0;
-  let sumSq = 0;
-  let recv = 0;
-  let total = 0;
-  for (const b of buckets) {
-    if (lo != null && hi != null && (b.t < lo || b.t >= hi)) continue;
-    if (b.count === 0) continue;
-    total += b.count;
-    if (b.worst != null) {
-      sum += b.worst;
-      sumSq += b.worst * b.worst;
-      recv += 1;
-    }
-  }
-  if (recv === 0) return { avg: null, jitter: null, lossPct: total > 0 ? 100 : 0 };
-  const avg = sum / recv;
-  const jitter = Math.sqrt(Math.max(0, sumSq / recv - avg * avg));
-  const lossPct = total > 0 ? ((total - recv) / total) * 100 : 0;
-  return { avg, jitter, lossPct };
-}
-
 async function refreshRow(row: Row): Promise<void> {
-  const { from, to } = currentWindow();
+  const { from, to, nb } = currentWindow();
   const sel = selectionWindow(); // stats reflect the custom selection when active
-  const n = Math.max(1, Math.floor(row.canvas.clientWidth));
+  const sFrom = sel ? sel.from : from;
+  const sTo = sel ? sel.to : to;
   const id = row.target.id;
   const profile = profileFor(row.target.tag);
   try {
-    let buckets: Bucket[];
-    let stats: { avg: number | null; jitter: number | null; lossPct: number };
-    if (state.oneToOne) {
-      // True 1:1 — one raw poll per pixel (no time-bucketing), ending at the shown instant.
-      buckets = await invoke<Bucket[]>("get_samples", { targetId: id, before: to, limit: n });
-      stats = statsFrom1to1(buckets, sel?.from, sel?.to);
-    } else {
-      const sFrom = sel ? sel.from : from;
-      const sTo = sel ? sel.to : to;
-      // Never request more buckets than there are seconds in the window: with 1s polling,
-      // sub-second buckets would leave periodic empty columns (a moiré of fake gaps). Capping
-      // at one-per-second keeps every column backed by a sample; drawBuckets stretches them.
-      const windowSecs = Math.max(1, Math.ceil((to - from) / 1000));
-      const nb = Math.min(n, windowSecs);
-      const [b, st] = await Promise.all([
-        invoke<Bucket[]>("get_window", { targetId: id, from, to, buckets: nb, agg: aggregate }),
-        invoke<WindowStats>("get_stats", { targetId: id, from: sFrom, to: sTo }),
-      ]);
-      buckets = b;
-      stats = { avg: st.avg, jitter: st.jitter, lossPct: st.lossPct };
-    }
+    // `nb` (from bucketPlan) is one whole-second-aligned bucket per ~pixel, so the x-axis is
+    // real time: real gaps show, uptime is honored, selection/CSV map to true timestamps, and
+    // the grid is pinned so bars don't morph as it scrolls. (1:1 = ~1 second per pixel.)
+    const [buckets, st] = await Promise.all([
+      invoke<Bucket[]>("get_window", { targetId: id, from, to, buckets: nb, agg: aggregate }),
+      invoke<WindowStats>("get_stats", { targetId: id, from: sFrom, to: sTo }),
+    ]);
     row.buckets = buckets;
     drawBuckets(row.canvas, buckets, profile);
 
-    row.avgEl.textContent = stats.avg == null ? "—" : `${fmtMs(stats.avg)}ms`;
-    row.avgEl.style.color = stats.avg == null ? "" : bandColor(stats.avg, profile);
-    row.jitEl.textContent = stats.jitter == null ? "—" : `±${fmtMs(stats.jitter)}`;
-    row.lossEl.textContent = fmtLoss(stats.lossPct);
-    row.lossEl.style.color = lossColor(stats.lossPct);
+    row.avgEl.textContent = st.avg == null ? "—" : `${fmtMs(st.avg)}ms`;
+    row.avgEl.style.color = st.avg == null ? "" : bandColor(st.avg, profile);
+    row.jitEl.textContent = st.jitter == null ? "—" : `±${fmtMs(st.jitter)}`;
+    row.lossEl.textContent = fmtLoss(st.lossPct);
+    row.lossEl.style.color = lossColor(st.lossPct);
   } catch {
     /* ignore */
   }
 }
 
+let refreshing = false;
+let refreshQueued = false;
+// Never let refreshes overlap: a fast drag or live tick that arrives mid-refresh just marks a
+// re-run, so at most one runs at a time (with the latest state) instead of backlogging N slow
+// queries per drag pixel. The scrollbar/overlay still update every move for a smooth thumb.
 async function refreshAll(): Promise<void> {
-  updateScrollbar();
-  updateSelectionOverlay();
-  await Promise.all([...rows.values()].map(refreshRow));
-  if (hoverX != null) updateCrosshairAt(hoverX); // keep readout on the data under the cursor
+  if (refreshing) {
+    refreshQueued = true;
+    return;
+  }
+  refreshing = true;
+  try {
+    updateScrollbar();
+    updateSelectionOverlay();
+    await Promise.all([...rows.values()].map(refreshRow));
+    if (hoverX != null) updateCrosshairAt(hoverX); // keep readout on the data under the cursor
+  } finally {
+    refreshing = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      void refreshAll();
+    }
+  }
 }
 
 let resizeTimer = 0;
@@ -1442,12 +1429,17 @@ async function main(): Promise<void> {
   window.addEventListener("resize", updateScrollbar);
   updateScrollbar();
 
+  // Live: redraw only when the pinned window edge crosses into a new bucket (every bucketMs) —
+  // so wide views update once per bucket, not every second, and bars step cleanly rather than
+  // shimmering. A short poll interval just watches for that boundary.
   window.setInterval(() => {
-    if (!state.paused && state.live && Date.now() - lastLiveRefresh >= liveIntervalMs()) {
-      lastLiveRefresh = Date.now();
+    if (state.paused || !state.live) return;
+    const to = currentWindow().to;
+    if (to !== lastLiveRefresh) {
+      lastLiveRefresh = to;
       refreshAll();
     }
-  }, 500);
+  }, 250);
   window.setInterval(refreshBounds, 30000);
 }
 

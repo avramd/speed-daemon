@@ -2,8 +2,12 @@ use crate::model::{Bucket, Target, WindowStats};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Read-only connections for parallel window/stats queries (WAL allows many readers).
+const N_READERS: usize = 8;
 
 /// Minimal CSV escaping: quote a field that contains a comma, quote, or newline.
 fn csv_field(s: &str) -> String {
@@ -28,46 +32,74 @@ pub fn now_ms() -> u64 {
 /// advances `last`, so gaps between uptime rows are time the app wasn't running.
 pub struct Db {
     conn: Mutex<Connection>,
+    /// Read-only connections handed out round-robin so per-target read queries run in parallel
+    /// instead of serializing on `conn` (which would freeze the UI on wide ranges).
+    readers: Vec<Mutex<Connection>>,
+    next: AtomicUsize,
     /// rowid of this run's uptime row.
     session: i64,
 }
 
 impl Db {
-    /// Open the history DB. In `readonly` mode (dev viewer sharing the real instance's
-    /// files) it creates no schema, starts no uptime session, and never writes — it just
-    /// reads the live-growing history alongside the real collector.
+    /// Open the history DB. In `readonly` mode (the GUI client sharing the daemon's files) it
+    /// creates no schema, starts no uptime session, and never writes — it just reads the
+    /// live-growing history alongside the daemon.
     pub fn open(path: &Path, readonly: bool) -> rusqlite::Result<Db> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch("PRAGMA busy_timeout=3000;")?;
+        // Generous busy_timeout on the writer: if the DB is briefly locked (e.g. an index build
+        // or checkpoint), the daemon's insert waits it out rather than dropping the sample.
+        conn.execute_batch("PRAGMA busy_timeout=10000;")?;
         let session = if readonly {
             -1
         } else {
+            // `idx_samples_cover` covers ts AND rtt, so window/stats queries are index-only (no
+            // per-row table lookup). Drop the old ts-only index it supersedes.
             conn.execute_batch(
                 "PRAGMA journal_mode=WAL;
                  PRAGMA synchronous=NORMAL;
                  CREATE TABLE IF NOT EXISTS samples (target_id TEXT NOT NULL, ts INTEGER NOT NULL, rtt REAL);
-                 CREATE INDEX IF NOT EXISTS idx_samples ON samples(target_id, ts);
+                 CREATE INDEX IF NOT EXISTS idx_samples_cover ON samples(target_id, ts, rtt);
+                 DROP INDEX IF EXISTS idx_samples;
                  CREATE TABLE IF NOT EXISTS uptime (start INTEGER NOT NULL, last INTEGER NOT NULL);",
             )?;
             let now = now_ms() as i64;
             conn.execute("INSERT INTO uptime (start, last) VALUES (?1, ?1)", [now])?;
             conn.last_insert_rowid()
         };
+
+        let mut readers = Vec::with_capacity(N_READERS);
+        for _ in 0..N_READERS {
+            let r = Connection::open(path)?;
+            r.execute_batch("PRAGMA busy_timeout=3000;")?;
+            readers.push(Mutex::new(r));
+        }
+
         Ok(Db {
             conn: Mutex::new(conn),
+            readers,
+            next: AtomicUsize::new(0),
             session,
         })
     }
 
+    /// A read connection from the pool (round-robin), for parallel read queries.
+    fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        self.readers[i].lock().unwrap()
+    }
+
     pub fn insert(&self, target_id: &str, ts: u64, rtt: Option<f64>) {
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute(
+        if let Err(e) = conn.execute(
             "INSERT INTO samples (target_id, ts, rtt) VALUES (?1, ?2, ?3)",
             rusqlite::params![target_id, ts as i64, rtt],
-        );
+        ) {
+            // Surface a dropped sample in the log instead of losing it silently.
+            eprintln!("speedd: dropped sample for {target_id}: {e}");
+        }
     }
 
     /// Advance this session's `last` so downtime can be inferred after a restart.
@@ -89,7 +121,7 @@ impl Db {
 
     /// Earliest known instant (oldest sample or first uptime start) for slider bounds.
     pub fn oldest(&self) -> Option<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let s: Option<i64> = conn
             .query_row("SELECT MIN(ts) FROM samples", [], |r| {
                 r.get::<_, Option<i64>>(0)
@@ -112,7 +144,7 @@ impl Db {
 
     /// Mean / jitter (std dev) / loss% over raw samples in [from, to) for one target.
     pub fn stats(&self, target_id: &str, from: u64, to: u64) -> WindowStats {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let row = conn
             .query_row(
                 "SELECT AVG(rtt), AVG(rtt*rtt), COUNT(*), COUNT(rtt) \
@@ -161,7 +193,7 @@ impl Db {
     ) -> Vec<Bucket> {
         let n = buckets.max(1);
         let span = to.saturating_sub(from).max(1);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
 
         let mut out: Vec<Bucket> = (0..n)
             .map(|i| Bucket {
@@ -271,7 +303,7 @@ impl Db {
     /// one `Bucket` each. The 1:1 view uses this to draw exactly one ping per pixel — no
     /// time-bucketing, so a bar is a single poll, not the worst RTT of a 1-second slice.
     pub fn recent(&self, target_id: &str, before: u64, limit: usize) -> Vec<Bucket> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let mut out: Vec<Bucket> = Vec::new();
         if let Ok(mut stmt) = conn.prepare(
             "SELECT ts, rtt FROM samples WHERE target_id = ?1 AND ts <= ?2 \
@@ -303,7 +335,7 @@ impl Db {
     /// polled that second. (With the 1s poll floor there's normally one poll per second per
     /// target; if two ever land in one second, the first wins.)
     pub fn export_csv(&self, from: u64, to: u64, targets: &[Target]) -> String {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.reader();
         let col: HashMap<&str, usize> = targets
             .iter()
             .enumerate()

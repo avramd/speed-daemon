@@ -32,66 +32,91 @@ pub fn get_config(cfg: State<Arc<ConfigState>>) -> AppConfig {
     cfg.config.lock().unwrap().clone()
 }
 
+// The read commands are async + spawn_blocking: the DB scan runs on a blocking thread (never
+// the UI thread, so no beachball) and, via the Db reader pool, per-target queries run in
+// parallel instead of serializing on one connection.
 #[tauri::command]
-pub fn get_window(
-    db: State<Arc<Db>>,
+pub async fn get_window(
+    db: State<'_, Arc<Db>>,
     target_id: String,
     from: u64,
     to: u64,
     buckets: usize,
     agg: String,
-) -> Vec<Bucket> {
-    db.window(&target_id, from, to, buckets, &agg)
+) -> Result<Vec<Bucket>, String> {
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || db.window(&target_id, from, to, buckets, &agg))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_stats(db: State<Arc<Db>>, target_id: String, from: u64, to: u64) -> WindowStats {
-    db.stats(&target_id, from, to)
+pub async fn get_stats(
+    db: State<'_, Arc<Db>>,
+    target_id: String,
+    from: u64,
+    to: u64,
+) -> Result<WindowStats, String> {
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || db.stats(&target_id, from, to))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The last `limit` raw samples at or before `before` (one Bucket per poll) for the true 1:1
 /// view, where each pixel column is a single ping rather than the worst of a time slice.
 #[tauri::command]
-pub fn get_samples(
-    db: State<Arc<Db>>,
+pub async fn get_samples(
+    db: State<'_, Arc<Db>>,
     target_id: String,
     before: u64,
     limit: usize,
-) -> Vec<Bucket> {
-    db.recent(&target_id, before, limit)
+) -> Result<Vec<Bucket>, String> {
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || db.recent(&target_id, before, limit))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Export the raw samples in [from, to) as CSV to the user's Downloads folder, then reveal it
 /// in Finder. Returns the saved file path.
 #[tauri::command]
-pub fn export_csv(
-    db: State<Arc<Db>>,
-    cfg: State<Arc<ConfigState>>,
+pub async fn export_csv(
+    db: State<'_, Arc<Db>>,
+    cfg: State<'_, Arc<ConfigState>>,
     from: u64,
     to: u64,
 ) -> Result<String, String> {
+    let db = db.inner().clone();
     let targets = cfg.config.lock().unwrap().targets.clone();
-    let csv = db.export_csv(from, to, &targets);
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
+        let csv = db.export_csv(from, to, &targets);
 
-    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
-    let downloads = PathBuf::from(&home).join("Downloads");
-    let dir = if downloads.is_dir() {
-        downloads
-    } else {
-        PathBuf::from(&home)
-    };
-    let path = dir.join(format!("speed-daemon_{}-{}.csv", from / 1000, to / 1000));
-    std::fs::write(&path, csv).map_err(|e| e.to_string())?;
+        let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+        let downloads = PathBuf::from(&home).join("Downloads");
+        let dir = if downloads.is_dir() {
+            downloads
+        } else {
+            PathBuf::from(&home)
+        };
+        let path = dir.join(format!("speed-daemon_{}-{}.csv", from / 1000, to / 1000));
+        std::fs::write(&path, csv).map_err(|e| e.to_string())?;
 
-    // Reveal in Finder (best-effort; the saved path is returned regardless).
-    let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+        // Reveal in Finder (best-effort; the saved path is returned regardless).
+        let _ = std::process::Command::new("open").arg("-R").arg(&path).spawn();
 
-    Ok(path.to_string_lossy().to_string())
+        Ok(path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn get_bounds(db: State<Arc<Db>>) -> u64 {
-    db.oldest().unwrap_or(0)
+pub async fn get_bounds(db: State<'_, Arc<Db>>) -> Result<u64, String> {
+    let db = db.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || db.oldest().unwrap_or(0))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

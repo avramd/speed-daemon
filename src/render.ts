@@ -31,6 +31,7 @@ const GREEN = "#3fb950";
 const YELLOW = "#d4c531";
 const ORANGE = "#db8b2a";
 const RED = "#e5484d";
+const BLACK = "#000000";
 
 /// Pull theme-dependent colors (strip background, grey gap) from CSS variables.
 /// Call on startup and whenever the theme changes.
@@ -44,6 +45,28 @@ export function bandColor(rtt: number, p: TagProfile): string {
   if (rtt <= p.good) return GREEN;
   if (rtt <= p.ok) return YELLOW;
   if (rtt <= p.poor) return ORANGE;
+  return RED;
+}
+
+/// Linear interpolate two #rrggbb colors (t clamped 0..1) -> "rgb(r, g, b)".
+function lerpColor(a: string, b: string, t: number): string {
+  const u = Math.max(0, Math.min(1, t));
+  const pa = parseInt(a.slice(1), 16);
+  const pb = parseInt(b.slice(1), 16);
+  const mix = (sh: number) => {
+    const ca = (pa >> sh) & 255;
+    const cb = (pb >> sh) & 255;
+    return Math.round(ca + (cb - ca) * u);
+  };
+  return `rgb(${mix(16)}, ${mix(8)}, ${mix(0)})`;
+}
+
+/// Smooth band: green up to `good`, green->orange across good..ok, orange->red across ok..terrible,
+/// red beyond. (`poor` isn't a stop — the gradient passes through it.)
+function bandColorGradient(rtt: number, p: TagProfile): string {
+  if (rtt <= p.good) return GREEN;
+  if (rtt <= p.ok) return lerpColor(GREEN, ORANGE, (rtt - p.good) / ((p.ok - p.good) || 1));
+  if (rtt < p.terrible) return lerpColor(ORANGE, RED, (rtt - p.ok) / ((p.terrible - p.ok) || 1));
   return RED;
 }
 
@@ -113,23 +136,25 @@ export function drawBuckets(
       continue;
     }
 
-    // Main bar = current aggregate.
+    // Main bar = current aggregate, colored by the smooth gradient.
     const h = logHeight(v, hi, cssH);
-    ctx.fillStyle = bandColor(v, profile);
+    ctx.fillStyle = bandColorGradient(v, profile);
     ctx.fillRect(x, cssH - h, w, h);
     if (b.loss > 0) {
       ctx.fillStyle = RED;
       ctx.fillRect(x, cssH - 1, w, 1); // partial-loss marker
     }
 
-    // Dots for the aggregates that aren't current, at their would-be tips. worst: band color.
-    // mean: band color in best mode, else a background "gap" dot punched into the bar. best: band
-    // color (may be hard on the eyes — swap to "#000000" here if so).
-    if (agg !== "worst" && b.worst != null) dot(x, w, b.worst, bandColor(b.worst, profile));
-    if (agg !== "mean" && b.mean != null) {
-      dot(x, w, b.mean, agg === "best" ? bandColor(b.mean, profile) : BG);
-    }
-    if (agg !== "best" && b.best != null) dot(x, w, b.best, bandColor(b.best, profile));
+    // Dots for the non-current aggregates at their would-be tips: black when the dot falls inside
+    // the bar (reads against the fill), else its own gradient color (reads above, on the bg).
+    const aggDot = (value: number | null) => {
+      if (value == null) return;
+      const dh = logHeight(value, hi, cssH);
+      dot(x, w, value, dh <= h ? BLACK : bandColorGradient(value, profile));
+    };
+    if (agg !== "worst") aggDot(b.worst);
+    if (agg !== "mean") aggDot(b.mean);
+    if (agg !== "best") aggDot(b.best);
   }
 }
 

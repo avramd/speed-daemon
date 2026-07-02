@@ -367,6 +367,49 @@ h3.sub {
   margin: 4px 0 8px;
 }
 
+.poller-row {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 12px;
+}
+
+.poller-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Prominent full-width warning when the poller isn't running. */
+.poller-banner {
+  display: block;
+  width: 100%;
+  border: none;
+  padding: 9px 14px;
+  background: #b62324;
+  color: #fff;
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  text-align: center;
+  cursor: pointer;
+}
+
+.poller-banner:hover {
+  background: #cf2b2c;
+}
+
+/* transient "Starting/Stopping poller…" — same color as the banner (only the message changes),
+   so a quick transition isn't noticeable; just drop the click affordance. */
+.poller-banner.pending {
+  cursor: default;
+}
+
+/* `display: block` above outranks the UA [hidden] rule, so restore it explicitly. */
+.poller-banner[hidden] {
+  display: none;
+}
+
 /* ---- custom selection window ---- */
 .selection {
   position: fixed;

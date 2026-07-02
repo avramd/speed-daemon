@@ -23,6 +23,10 @@
       <button id="settings-btn" class="icon-btn" title="Thresholds">⚙</button>
     </header>
 
+    <button id="poller-banner" class="poller-banner" type="button" hidden>
+      Poller disabled — click to open Settings
+    </button>
+
     <div class="controls">
       <div id="ranges" class="ranges"></div>
       <label class="agg-ctl" title="How each 1px bar reduces the samples it covers">aggregate:
@@ -91,6 +95,12 @@
           <label><input type="radio" name="theme" value="system" /> System</label>
           <label><input type="radio" name="theme" value="light" /> Light</label>
           <label><input type="radio" name="theme" value="dark" /> Dark</label>
+        </div>
+        <h3 class="sub">Poller</h3>
+        <div class="poller-row">
+          <label><input type="checkbox" id="s-poller-run" /> Run poller</label>
+          <label><input type="checkbox" id="s-poller-login" /> Launch at login</label>
+          <span id="s-poller-state" class="hint"></span>
         </div>
         <h3 class="sub">Response-time thresholds (ms)</h3>
         <div class="thresh-grid">

@@ -27,6 +27,187 @@ fn reload_daemon() {
         .status();
 }
 
+// ---- poller (speedd LaunchAgent) control -----------------------------------
+//
+// The GUI owns the per-user LaunchAgent so end users never touch a terminal. Two independent
+// controls:
+//   - "run poller"     -> load/kickstart (start now) vs bootout (stop now); this session.
+//   - "launch at login" -> the plist's RunAtLoad/KeepAlive, which macOS reads when it bootstraps
+//                          ~/Library/LaunchAgents at login. Rewriting the file affects the NEXT
+//                          login; the currently-loaded job is untouched, so the two don't fight.
+
+const LABEL: &str = "org.est.speeddaemon";
+
+fn svc_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+fn svc_domain() -> String {
+    format!("gui/{}", svc_uid())
+}
+fn svc_target() -> String {
+    format!("gui/{}/{}", svc_uid(), LABEL)
+}
+fn plist_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join("Library/LaunchAgents")
+        .join(format!("{LABEL}.plist"))
+}
+
+/// The speedd binary the LaunchAgent runs. It lives at a STABLE path in the data dir — never
+/// inside the app bundle — so app updates/moves don't replace a running binary out from under
+/// launchd (an OS_REASON_CODESIGNING kill) or leave a dangling agent. Stage 2 will copy the
+/// bundled speedd here on install/update; in dev, bin/speedd-ctl puts it here.
+fn speedd_path() -> PathBuf {
+    config::data_dir().join("speedd")
+}
+
+fn launchctl(args: &[&str]) -> bool {
+    std::process::Command::new("launchctl")
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn poller_running() -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", &svc_target()])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("state = running"))
+        .unwrap_or(false)
+}
+
+/// Whether the service is bootstrapped into launchd (loaded), running or not.
+fn poller_loaded() -> bool {
+    std::process::Command::new("launchctl")
+        .args(["print", &svc_target()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// True if the installed plist auto-starts at login (the `<true/>` after RunAtLoad comes before
+/// any `<false/>`).
+fn plist_at_login() -> bool {
+    let Ok(s) = std::fs::read_to_string(plist_path()) else {
+        return false;
+    };
+    let Some(i) = s.find("RunAtLoad") else {
+        return false;
+    };
+    let rest = &s[i + "RunAtLoad".len()..];
+    match (rest.find("<true/>"), rest.find("<false/>")) {
+        (Some(_), None) => true,
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
+}
+
+fn write_plist(at_login: bool) -> std::io::Result<()> {
+    let path = plist_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let b = |v: bool| if v { "<true/>" } else { "<false/>" };
+    let content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{bin}</string>
+    </array>
+    <key>RunAtLoad</key>
+    {run}
+    <key>KeepAlive</key>
+    {keep}
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"#,
+        bin = speedd_path().display(),
+        log = config::data_dir().join("speedd.log").display(),
+        run = b(at_login),
+        keep = b(at_login),
+    );
+    std::fs::write(path, content)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PollerStatus {
+    running: bool,
+    at_login: bool,
+    installed: bool,
+}
+
+fn poller_state() -> PollerStatus {
+    PollerStatus {
+        running: poller_running(),
+        at_login: plist_path().exists() && plist_at_login(),
+        installed: plist_path().exists(),
+    }
+}
+
+#[tauri::command]
+pub async fn poller_status() -> Result<PollerStatus, String> {
+    tauri::async_runtime::spawn_blocking(poller_state)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_poller_running(run: bool) -> Result<PollerStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if run {
+            if !plist_path().exists() {
+                let _ = write_plist(true);
+            }
+            let plist = plist_path().to_string_lossy().to_string();
+            // A bootstrap immediately after a bootout fails with EIO until the old instance
+            // finishes unloading — retry briefly until the service is actually loaded.
+            for _ in 0..15 {
+                if poller_loaded() {
+                    break;
+                }
+                let _ = launchctl(&["bootstrap", &svc_domain(), &plist]);
+                if poller_loaded() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+            // No `-k`: bootstrap already started it via RunAtLoad. A plain kickstart just starts
+            // it if the plist has RunAtLoad=false (launch-at-login off); it's a no-op otherwise.
+            // (`-k` would kill the fresh instance and restart it — a wasteful double-start.)
+            let _ = launchctl(&["kickstart", &svc_target()]);
+        } else {
+            let _ = launchctl(&["bootout", &svc_target()]);
+        }
+        poller_state()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn set_poller_at_login(enabled: bool) -> Result<PollerStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Rewrite the plist only — takes effect at the next login; the loaded job is untouched.
+        let _ = write_plist(enabled);
+        poller_state()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn get_config(cfg: State<Arc<ConfigState>>) -> AppConfig {
     cfg.config.lock().unwrap().clone()

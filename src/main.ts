@@ -524,7 +524,7 @@ function getCat(cat: string): [number, number, number, number] {
   ];
 }
 
-function openSettings(): void {
+async function openSettings(): Promise<void> {
   for (const cat of Object.keys(CAT_TAG)) {
     const p = profiles.get(CAT_TAG[cat]);
     setCat(cat, p ? [p.good, p.ok, p.poor, p.terrible] : THRESH_DEFAULTS[cat]);
@@ -532,11 +532,98 @@ function openSettings(): void {
   document.querySelectorAll<HTMLInputElement>('input[name="theme"]').forEach((r) => {
     r.checked = r.value === themeSetting;
   });
+  await refreshPollerStatus();
+  q<HTMLInputElement>("#s-poller-run").checked = pollerStatus.running;
+  q<HTMLInputElement>("#s-poller-login").checked = pollerStatus.atLogin;
   settingsModal.hidden = false;
 }
 
 function closeSettings(): void {
   settingsModal.hidden = true;
+}
+
+// ---- poller (daemon) control ---------------------------------------------
+
+interface PollerStatus {
+  running: boolean;
+  atLogin: boolean;
+  installed: boolean;
+}
+
+let pollerStatus: PollerStatus = { running: false, atLogin: false, installed: false };
+let pollerPending = false; // a start/stop is in flight — don't let the poll clobber its indicator
+const BANNER_DEFAULT = "Poller disabled — click to open Settings";
+
+// Live status drives the banner + status line only. The checkboxes are desired-state — edited
+// freely and applied on Save — so the 4s poll never stomps a pending toggle and there's no
+// per-toggle launchd race (the flaky "checked then self-disables").
+function renderPollerStatus(): void {
+  if (!pollerPending) {
+    const banner = q<HTMLElement>("#poller-banner");
+    banner.classList.remove("pending");
+    banner.textContent = BANNER_DEFAULT;
+    banner.hidden = pollerStatus.running;
+  }
+  q<HTMLElement>("#s-poller-state").textContent = !pollerStatus.installed
+    ? "not installed"
+    : pollerStatus.running
+      ? "running"
+      : "stopped";
+}
+
+async function refreshPollerStatus(): Promise<void> {
+  try {
+    pollerStatus = await invoke<PollerStatus>("poller_status");
+    renderPollerStatus();
+  } catch {
+    /* ignore */
+  }
+}
+
+// Apply the poller checkboxes (from Save): login persistence first, then run state. Runs in the
+// background (the modal is already dismissed); while a start/stop is in flight the banner shows a
+// "Starting/Stopping poller…" indicator, since launchctl can take several seconds.
+async function applyPollerSettings(): Promise<void> {
+  const wantLogin = q<HTMLInputElement>("#s-poller-login").checked;
+  const wantRun = q<HTMLInputElement>("#s-poller-run").checked;
+  const runChanging = wantRun !== pollerStatus.running;
+  if (runChanging) {
+    pollerPending = true;
+    const banner = q<HTMLElement>("#poller-banner");
+    banner.textContent = wantRun ? "Starting poller…" : "Stopping poller…";
+    banner.classList.add("pending");
+    banner.hidden = false;
+  }
+  try {
+    if (wantLogin !== pollerStatus.atLogin) {
+      pollerStatus = await invoke<PollerStatus>("set_poller_at_login", { enabled: wantLogin });
+    }
+    if (runChanging) {
+      pollerStatus = await invoke<PollerStatus>("set_poller_running", { run: wantRun });
+    }
+  } catch (e) {
+    console.error("poller settings failed", e);
+  }
+  // Hold the "Starting/Stopping…" indicator until the live state actually reaches the target
+  // (or a timeout), so the transition never flashes the opposite banner.
+  if (runChanging) {
+    for (let i = 0; i < 20 && pollerStatus.running !== wantRun; i++) {
+      await new Promise((r) => setTimeout(r, 300));
+      try {
+        pollerStatus = await invoke<PollerStatus>("poller_status");
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  pollerPending = false;
+  renderPollerStatus();
+}
+
+function wirePoller(): void {
+  q<HTMLElement>("#poller-banner").addEventListener("click", openSettings);
+  void refreshPollerStatus();
+  window.setInterval(refreshPollerStatus, 4000);
 }
 
 async function saveSettings(): Promise<void> {
@@ -561,8 +648,9 @@ async function saveSettings(): Promise<void> {
     return;
   }
   profiles = new Map(tags.map((t) => [t.tag, t]));
-  closeSettings();
+  closeSettings(); // dismiss + un-dim immediately; the poller start/stop runs in the background
   refreshAll();
+  void applyPollerSettings();
 }
 
 function wireSettings(): void {
@@ -1425,6 +1513,7 @@ async function main(): Promise<void> {
   wireAddForm();
   wireEditor();
   wireSettings();
+  wirePoller();
   wireCrosshair();
   wireSelection();
   wireNetwork();

@@ -4,7 +4,7 @@ use crate::model::{AppConfig, Bucket, NodeInfo, Peer, TagProfile, Target, Window
 use crate::net::Net;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::State;
 
@@ -164,32 +164,109 @@ pub async fn poller_status() -> Result<PollerStatus, String> {
         .map_err(|e| e.to_string())
 }
 
+fn start_poller() {
+    if !plist_path().exists() {
+        let _ = write_plist(true);
+    }
+    let plist = plist_path().to_string_lossy().to_string();
+    // A bootstrap immediately after a bootout fails with EIO until the old instance finishes
+    // unloading — retry briefly until the service is actually loaded.
+    for _ in 0..15 {
+        if poller_loaded() {
+            break;
+        }
+        let _ = launchctl(&["bootstrap", &svc_domain(), &plist]);
+        if poller_loaded() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    // No `-k`: bootstrap already started it via RunAtLoad. A plain kickstart just starts it if the
+    // plist has RunAtLoad=false (launch-at-login off); it's a no-op otherwise. (`-k` would kill the
+    // fresh instance and restart it — a wasteful double-start.)
+    let _ = launchctl(&["kickstart", &svc_target()]);
+}
+
+fn stop_poller() {
+    let _ = launchctl(&["bootout", &svc_target()]);
+}
+
+fn restart_poller() {
+    stop_poller();
+    for _ in 0..15 {
+        if !poller_loaded() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    start_poller();
+}
+
+/// The speedd binary Tauri bundles beside the app executable, if present (packaged build).
+fn bundled_speedd() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("speedd")))
+        .filter(|p| p.exists())
+}
+
+fn mtime_secs(p: &Path) -> Option<u64> {
+    std::fs::metadata(p)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Keep the app self-contained: on launch, copy the bundled speedd to the stable data-dir path
+/// (atomically, so a running daemon isn't code-sign-killed), first-run install the LaunchAgent,
+/// and restart a running daemon when the binary changed. Skips gracefully in dev builds that
+/// don't bundle speedd. Runs off the main thread (blocking launchctl / file IO).
+pub fn ensure_poller_installed() {
+    let stable = speedd_path();
+    let stamp = config::data_dir().join("speedd.stamp");
+    let mut updated = false;
+
+    if let Some(bundled) = bundled_speedd() {
+        // The bundle's speedd mtime is fixed at build time, so it's a stable "version" marker —
+        // unlike the copy's mtime, which would change every launch and re-trigger the copy.
+        let bmtime = mtime_secs(&bundled);
+        let stamped = std::fs::read_to_string(&stamp)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        if !stable.exists() || bmtime.is_none() || stamped != bmtime {
+            if let Some(dir) = stable.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let tmp = stable.with_extension("new");
+            if std::fs::copy(&bundled, &tmp).is_ok() && std::fs::rename(&tmp, &stable).is_ok() {
+                updated = true;
+                if let Some(m) = bmtime {
+                    let _ = std::fs::write(&stamp, m.to_string());
+                }
+            }
+        }
+    }
+
+    if !plist_path().exists() {
+        // First run: install the agent and start polling (the user can disable it in Settings).
+        let _ = write_plist(true);
+        start_poller();
+    } else if updated && poller_loaded() {
+        // App updated the binary and the daemon is running — restart it onto the new speedd.
+        restart_poller();
+    }
+}
+
 #[tauri::command]
 pub async fn set_poller_running(run: bool) -> Result<PollerStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
         if run {
-            if !plist_path().exists() {
-                let _ = write_plist(true);
-            }
-            let plist = plist_path().to_string_lossy().to_string();
-            // A bootstrap immediately after a bootout fails with EIO until the old instance
-            // finishes unloading — retry briefly until the service is actually loaded.
-            for _ in 0..15 {
-                if poller_loaded() {
-                    break;
-                }
-                let _ = launchctl(&["bootstrap", &svc_domain(), &plist]);
-                if poller_loaded() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(300));
-            }
-            // No `-k`: bootstrap already started it via RunAtLoad. A plain kickstart just starts
-            // it if the plist has RunAtLoad=false (launch-at-login off); it's a no-op otherwise.
-            // (`-k` would kill the fresh instance and restart it — a wasteful double-start.)
-            let _ = launchctl(&["kickstart", &svc_target()]);
+            start_poller();
         } else {
-            let _ = launchctl(&["bootout", &svc_target()]);
+            stop_poller();
         }
         poller_state()
     })

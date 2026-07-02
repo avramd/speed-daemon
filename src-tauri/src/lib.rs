@@ -77,6 +77,11 @@ pub fn run() {
             app.manage(cfg_state);
             app.manage(net);
 
+            // Self-contained install: copy the bundled speedd to the stable data-dir path,
+            // first-run install the LaunchAgent, and restart the daemon if the binary changed.
+            // Off the main thread (blocking launchctl / file IO).
+            std::thread::spawn(commands::ensure_poller_installed);
+
             // No autostart for the GUI: it's an on-demand viewer now. The always-on poller is
             // the `speedd` LaunchAgent (managed by bin/speedd-ctl), not this app.
 

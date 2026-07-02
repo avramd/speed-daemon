@@ -52,6 +52,13 @@ async fn main() {
             loop {
                 hb.heartbeat();
                 ticks += 1;
+                // Every 30s truncate the WAL so it can't grow unbounded while the GUI's readers
+                // keep the passive auto-checkpoint from ever making progress. Off-thread so the
+                // (briefly blocking) checkpoint never stalls the async runtime.
+                if ticks % 6 == 0 {
+                    let c = hb.clone();
+                    tokio::task::spawn_blocking(move || c.checkpoint());
+                }
                 if ticks % 720 == 0 {
                     hb.prune();
                 }

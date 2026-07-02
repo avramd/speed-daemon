@@ -1,10 +1,10 @@
 use crate::model::{Bucket, Target, WindowStats};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Read-only connections for parallel window/stats queries (WAL allows many readers).
 const N_READERS: usize = 8;
@@ -36,6 +36,8 @@ pub struct Db {
     /// instead of serializing on `conn` (which would freeze the UI on wide ranges).
     readers: Vec<Mutex<Connection>>,
     next: AtomicUsize,
+    /// DB file path, so `checkpoint()` can open its own short-lived connection.
+    path: PathBuf,
     /// rowid of this run's uptime row.
     session: i64,
 }
@@ -60,6 +62,10 @@ impl Db {
             conn.execute_batch(
                 "PRAGMA journal_mode=WAL;
                  PRAGMA synchronous=NORMAL;
+                 -- No auto-checkpoint on the insert path: a passive checkpoint can't make progress
+                 -- while the GUI's readers are active, so attempting one on every commit is pure
+                 -- overhead. `checkpoint()` (TRUNCATE, every 30s) is the sole checkpoint instead.
+                 PRAGMA wal_autocheckpoint=0;
                  CREATE TABLE IF NOT EXISTS samples (target_id TEXT NOT NULL, ts INTEGER NOT NULL, rtt REAL);
                  CREATE INDEX IF NOT EXISTS idx_samples_cover ON samples(target_id, ts, rtt);
                  DROP INDEX IF EXISTS idx_samples;
@@ -81,6 +87,7 @@ impl Db {
             conn: Mutex::new(conn),
             readers,
             next: AtomicUsize::new(0),
+            path: path.to_path_buf(),
             session,
         })
     }
@@ -89,6 +96,20 @@ impl Db {
     fn reader(&self) -> std::sync::MutexGuard<'_, Connection> {
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.readers.len();
         self.readers[i].lock().unwrap()
+    }
+
+    /// Force a full checkpoint and truncate the WAL. Under WAL, SQLite's passive auto-checkpoint
+    /// makes no progress while a reader is active — and the GUI keeps 8 reader connections busy,
+    /// so the WAL grows without bound (seen: 238 MB), which slows *every* query and makes the
+    /// live view update in clumps. The daemon calls this on a timer. It runs on its own
+    /// short-lived connection so it never blocks inserts or reads; if readers happen to be active
+    /// it just returns SQLITE_BUSY and we retry next tick (the brief idle between GUI refreshes is
+    /// enough to win the truncate).
+    pub fn checkpoint(&self) {
+        if let Ok(conn) = Connection::open(&self.path) {
+            let _ = conn.busy_timeout(Duration::from_millis(2000));
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        }
     }
 
     pub fn insert(&self, target_id: &str, ts: u64, rtt: Option<f64>) {

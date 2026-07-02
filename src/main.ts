@@ -62,14 +62,18 @@ const state = {
   paused: false,
   frozenTo: Date.now(),
   oneToOne: false, // window span = strip width in px (one ping per column)
+  oneN: 1, // 1:N zoom — each poll bar is N px wide (1/2/4), so anomalies are easier to spot
 };
 
 function stripWidthPx(): number {
   return firstStripRect()?.width ?? 600;
 }
-// Effective range: in 1:1 mode it's the strip width in pixels (≈ seconds at 1 ping/s).
+// Effective range: in 1:1 mode it's the strip width in pixels (≈ seconds at 1 ping/s). In 1:N
+// zoom each poll bar is N px wide, so the window spans (width / N) seconds instead.
 function curRangeSec(): number {
-  return state.oneToOne ? Math.max(60, Math.floor(stripWidthPx())) : state.rangeSec;
+  return state.oneToOne
+    ? Math.max(60, Math.floor(stripWidthPx() / state.oneN))
+    : state.rangeSec;
 }
 function rangeMs(): number {
   return curRangeSec() * 1000;
@@ -640,6 +644,10 @@ function updateRangeActive(): void {
         ? b.dataset.one === "1"
         : b.dataset.sec !== undefined && Number(b.dataset.sec) === state.rangeSec;
       b.classList.toggle("active", active);
+      // The 1:1 button shows the live zoom factor (1:1 / 1:2 / 1:4) when 1:N is active.
+      if (b.dataset.one === "1") {
+        b.textContent = `1:${state.oneToOne ? state.oneN : 1}`;
+      }
     });
 }
 
@@ -650,8 +658,11 @@ function buildControls(): void {
   oneBtn.className = "range";
   oneBtn.textContent = "1:1";
   oneBtn.dataset.one = "1";
-  oneBtn.title = "One ping per pixel (window = strip width)";
-  oneBtn.addEventListener("click", () => {
+  oneBtn.title = "One ping per pixel (⌥-click to zoom: 1:2, 1:4, back to 1:1)";
+  oneBtn.addEventListener("click", (e) => {
+    // ⌥-click cycles the hidden 1:N zoom (each poll bar N px wide): 1→2→4→1. A plain click is
+    // ordinary 1:1.
+    state.oneN = e.altKey ? (state.oneN === 1 ? 2 : state.oneN === 2 ? 4 : 1) : 1;
     state.oneToOne = true;
     selection = null;
     updateSelectionOverlay();
@@ -668,6 +679,7 @@ function buildControls(): void {
     btn.addEventListener("click", () => {
       state.rangeSec = r.sec;
       state.oneToOne = false;
+      state.oneN = 1; // leave 1:N so re-entering 1:1 starts clean
       selection = null; // a selection's offsets don't carry meaning across ranges
       updateSelectionOverlay();
       updateRangeActive();

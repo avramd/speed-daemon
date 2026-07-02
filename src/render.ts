@@ -8,7 +8,10 @@
 
 export interface Bucket {
   t: number;
+  val: number | null; // current aggregate (the drawn bar)
   worst: number | null;
+  mean: number | null;
+  best: number | null;
   loss: number;
   count: number;
   up: boolean;
@@ -57,6 +60,7 @@ export function drawBuckets(
   canvas: HTMLCanvasElement,
   buckets: Bucket[],
   profile: TagProfile,
+  agg = "worst",
 ): void {
   const ctx = canvas.getContext("2d");
   if (!ctx) return;
@@ -81,6 +85,14 @@ export function drawBuckets(
   // Buckets map 1:1 to pixels when we asked for floor(width) of them; if not, scale x.
   const scale = n > 0 ? cssW / n : 1;
 
+  // A dot marking where an aggregate's bar tip would land (for a worst/mean/best that isn't the
+  // current one) — so all three are always readable without cluttering with three full bars.
+  const dot = (x: number, w: number, v: number, color: string) => {
+    const y = cssH - logHeight(v, hi, cssH);
+    ctx.fillStyle = color;
+    ctx.fillRect(x, Math.max(0, Math.min(cssH - 2, y - 1)), w, 2);
+  };
+
   for (let i = 0; i < n; i++) {
     const b = buckets[i];
     const x = Math.floor(i * scale);
@@ -93,20 +105,31 @@ export function drawBuckets(
     }
     if (b.count === 0) continue; // up but no probe -> blank
 
-    if (b.worst == null) {
+    const v = b.val ?? b.worst; // current aggregate (fallback keeps legacy buckets drawable)
+    if (v == null) {
       // ran but every probe lost -> red baseline tick
       ctx.fillStyle = RED;
       ctx.fillRect(x, cssH - 3, w, 3);
       continue;
     }
 
-    const h = logHeight(b.worst, hi, cssH);
-    ctx.fillStyle = bandColor(b.worst, profile);
+    // Main bar = current aggregate.
+    const h = logHeight(v, hi, cssH);
+    ctx.fillStyle = bandColor(v, profile);
     ctx.fillRect(x, cssH - h, w, h);
     if (b.loss > 0) {
       ctx.fillStyle = RED;
       ctx.fillRect(x, cssH - 1, w, 1); // partial-loss marker
     }
+
+    // Dots for the aggregates that aren't current, at their would-be tips. worst: band color.
+    // mean: band color in best mode, else a background "gap" dot punched into the bar. best: band
+    // color (may be hard on the eyes — swap to "#000000" here if so).
+    if (agg !== "worst" && b.worst != null) dot(x, w, b.worst, bandColor(b.worst, profile));
+    if (agg !== "mean" && b.mean != null) {
+      dot(x, w, b.mean, agg === "best" ? bandColor(b.mean, profile) : BG);
+    }
+    if (agg !== "best" && b.best != null) dot(x, w, b.best, bandColor(b.best, profile));
   }
 }
 

@@ -292,7 +292,7 @@ async function refreshRow(row: Row): Promise<void> {
       invoke<WindowStats>("get_stats", { targetId: id, from: sFrom, to: sTo }),
     ]);
     row.buckets = buckets;
-    drawBuckets(row.canvas, buckets, profile);
+    drawBuckets(row.canvas, buckets, profile, aggregate);
 
     row.avgEl.textContent = st.avg == null ? "—" : `${fmtMs(st.avg)}ms`;
     row.avgEl.style.color = st.avg == null ? "" : bandColor(st.avg, profile);
@@ -956,7 +956,8 @@ function showCrosshair(clientX: number, stripRight: number, i: number): void {
   const flip = clientX > stripRight - 44; // near right edge -> draw label to the left
   for (const row of rows.values()) {
     const b = row.buckets[i];
-    row.hoverVal.textContent = b && b.worst != null ? fmtMs(b.worst) : "-";
+    const hv = b ? b.val ?? b.worst : null;
+    row.hoverVal.textContent = hv != null ? fmtMs(hv) : "-";
     row.hoverVal.style.left = `${clientX - row.rowEl.getBoundingClientRect().left}px`;
     row.hoverVal.classList.toggle("flip", flip);
     row.hoverVal.hidden = false;
@@ -1185,7 +1186,16 @@ function onRemote(ev: RemoteEvent): void {
       lossPct: r.lossPct,
       ts: ev.ts,
     });
-    n.buffer.push({ t: ev.ts, worst: r.rttMs, loss: (r.lossPct || 0) / 100, count: 1, up: true });
+    n.buffer.push({
+      t: ev.ts,
+      val: r.rttMs,
+      worst: r.rttMs,
+      mean: r.rttMs,
+      best: r.rttMs,
+      loss: (r.lossPct || 0) / 100,
+      count: 1,
+      up: true,
+    });
     if (n.buffer.length > 300) n.buffer.shift();
   }
   refreshFilterOptions();

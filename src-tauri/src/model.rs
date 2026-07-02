@@ -109,14 +109,19 @@ pub struct SampleEvent {
 }
 
 /// One aggregated time slice of history, produced by `get_window`. Each bucket maps to a
-/// single pixel column. `worst` is the max RTT among successful probes in the slice (None
-/// if none succeeded); `loss` is the fraction of attempts lost; `count` is attempts; `up`
-/// is whether the daemon was running for any part of the slice (false -> render grey).
+/// single pixel column. `val` is the current aggregate's value (the drawn bar); `worst`/`mean`/
+/// `best` are the max/avg/min RTT among successful probes in the slice (each None if none
+/// succeeded), always provided so the renderer can dot the non-current aggregates. `loss` is the
+/// fraction of attempts lost; `count` is attempts; `up` is whether the daemon was running for any
+/// part of the slice (false -> render grey).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Bucket {
     pub t: u64,
+    pub val: Option<f64>,
     pub worst: Option<f64>,
+    pub mean: Option<f64>,
+    pub best: Option<f64>,
     pub loss: f64,
     pub count: u32,
     pub up: bool,

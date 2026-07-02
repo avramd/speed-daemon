@@ -219,45 +219,52 @@ impl Db {
         let mut out: Vec<Bucket> = (0..n)
             .map(|i| Bucket {
                 t: from + span * i as u64 / n as u64,
+                val: None,
                 worst: None,
+                mean: None,
+                best: None,
                 loss: 0.0,
                 count: 0,
                 up: false,
             })
             .collect();
 
-        // Pass 1: loss + count per bucket, plus the value for the simple modes (a NULL-ignoring
-        // SQL aggregate). median/trimmed need ranked values, computed in pass 2 below.
-        let val_expr = match agg {
-            "best" => "MIN(rtt)",
-            "mean" => "AVG(rtt)",
-            _ => "MAX(rtt)", // "worst" (also a harmless placeholder for median/trimmed)
-        };
-        let q = format!(
-            "SELECT ((ts - ?1) * ?2 / ?3) AS b, \
-                    {val_expr}, \
-                    SUM(CASE WHEN rtt IS NULL THEN 1 ELSE 0 END), \
-                    COUNT(*) \
-             FROM samples \
-             WHERE target_id = ?4 AND ts >= ?1 AND ts < ?5 \
-             GROUP BY b"
-        );
-        if let Ok(mut stmt) = conn.prepare(&q) {
+        // Pass 1: loss + count per bucket, plus all three simple aggregates (worst=MAX, mean=AVG,
+        // best=MIN) — always computed so the renderer can dot the non-current ones. `val` (the
+        // drawn bar) is one of these unless the mode is median/trimmed, which pass 2 fills.
+        let q = "SELECT ((ts - ?1) * ?2 / ?3) AS b, \
+                        MAX(rtt), AVG(rtt), MIN(rtt), \
+                        SUM(CASE WHEN rtt IS NULL THEN 1 ELSE 0 END), \
+                        COUNT(*) \
+                 FROM samples \
+                 WHERE target_id = ?4 AND ts >= ?1 AND ts < ?5 \
+                 GROUP BY b";
+        if let Ok(mut stmt) = conn.prepare(q) {
             let rows = stmt.query_map(
                 rusqlite::params![from as i64, n as i64, span as i64, target_id, to as i64],
                 |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
                         r.get::<_, Option<f64>>(1)?,
-                        r.get::<_, i64>(2)?,
-                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<f64>>(2)?,
+                        r.get::<_, Option<f64>>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
                     ))
                 },
             );
             if let Ok(rows) = rows {
-                for (b, value, lost, cnt) in rows.flatten() {
+                for (b, worst, mean, best, lost, cnt) in rows.flatten() {
                     let i = (b.max(0) as usize).min(n - 1);
-                    out[i].worst = value;
+                    out[i].worst = worst;
+                    out[i].mean = mean;
+                    out[i].best = best;
+                    out[i].val = match agg {
+                        "best" => best,
+                        "mean" => mean,
+                        "median" | "trimmed" => None, // filled by pass 2
+                        _ => worst,
+                    };
                     out[i].count = cnt as u32;
                     out[i].loss = if cnt > 0 { lost as f64 / cnt as f64 } else { 0.0 };
                     // A bucket with samples was necessarily up — mark it so directly, rather than
@@ -298,7 +305,7 @@ impl Db {
                 if let Ok(rows) = rows {
                     for (b, value) in rows.flatten() {
                         let i = (b.max(0) as usize).min(n - 1);
-                        out[i].worst = value;
+                        out[i].val = value;
                     }
                 }
             }
@@ -344,9 +351,13 @@ impl Db {
             );
             if let Ok(rows) = rows {
                 for (ts, rtt) in rows.flatten() {
+                    // One raw sample per bucket, so every aggregate collapses to that value.
                     out.push(Bucket {
                         t: ts as u64,
+                        val: rtt,
                         worst: rtt,
+                        mean: rtt,
+                        best: rtt,
                         loss: if rtt.is_none() { 1.0 } else { 0.0 },
                         count: 1,
                         up: true,

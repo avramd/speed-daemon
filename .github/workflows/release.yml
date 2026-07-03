@@ -1,0 +1,81 @@
+name: Release
+
+# Build a signed + notarized UNIVERSAL macOS .dmg and attach it to a GitHub Release.
+# Trigger by pushing a version tag:  git tag v0.1.0 && git push origin v0.1.0   (or run manually).
+#
+# Required repository secrets  (Settings → Secrets and variables → Actions → New repository secret):
+#   APPLE_CERTIFICATE            base64 of the Developer ID Application cert exported as .p12.
+#                                Keychain Access → right-click the cert → Export (.p12, set a password),
+#                                then:  base64 -i DeveloperID.p12 | pbcopy
+#   APPLE_CERTIFICATE_PASSWORD   the password you set on that .p12 export
+#   APPLE_SIGNING_IDENTITY       Developer ID Application: Avram Dorfman (EGDD7PHX5D)
+#   APPLE_ID                     your Apple ID email (used for notarization)
+#   APPLE_PASSWORD               an app-specific password — appleid.apple.com → Sign-In & Security →
+#                                App-Specific Passwords (NOT your normal Apple ID password)
+#   APPLE_TEAM_ID                EGDD7PHX5D
+# GITHUB_TOKEN is provided automatically; no secret needed for it.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: macos-latest
+    permissions:
+      contents: write # create the Release and upload the .dmg
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Rust toolchain (Intel + Apple Silicon)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build, sign, notarize, and draft the release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: --target universal-apple-darwin
+          tagName: ${{ github.ref_name }}
+          releaseName: Speed Daemon ${{ github.ref_name }}
+          releaseDraft: true
+          releaseBody: |
+            Signed & notarized universal macOS build.
+
+            Open the .dmg and drag **Speed Daemon** to Applications, then launch it — it
+            installs and starts the background poller automatically (no terminal needed).
+            Manage the poller in **Settings → Poller**.
+
+      # Safety check: Tauri lipo's the app binary for a universal build, but the auto-included
+      # `speedd` helper may not be. The release is a DRAFT, so inspect this before publishing —
+      # if speedd is single-arch we'll add an explicit lipo step.
+      - name: Verify both binaries are universal
+        if: always()
+        run: |
+          app=$(find src-tauri/target/universal-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' | head -1)
+          echo "app bundle: $app"
+          for bin in speed-daemon speedd; do
+            printf '%s -> ' "$bin"
+            lipo -archs "$app/Contents/MacOS/$bin" 2>&1 || true
+          done

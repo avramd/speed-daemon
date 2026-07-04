@@ -90,9 +90,16 @@ pub fn spawn(db: Arc<Db>, target: Target, stop: Arc<AtomicBool>) {
                 pinger = None;
             }
 
-            // Schedule the next poll a full interval after THIS send, so two sends are never
-            // less than `interval` (>= 1s) apart regardless of resolve/ping jitter.
-            next_send = Instant::now() + interval;
+            // Advance the schedule at a FIXED RATE — from the previous scheduled time, not from
+            // `now` — so per-cycle wake/ping jitter (~3ms) doesn't accumulate and slide the send
+            // phase off the wall-clock second (which otherwise drops ~1 sample every few minutes
+            // in the 1:1 view). Two sends stay >= `interval` apart in the normal case; a gross
+            // overrun (ping+resolve exceeded the interval) re-anchors instead of bursting.
+            next_send += interval;
+            let cur = Instant::now();
+            if next_send <= cur {
+                next_send = cur + interval;
+            }
 
             // Stamp the sample with the SEND time, not the reply time: the reply lands `rtt` ms
             // later, and that jitter (often ±150ms) would otherwise bump samples across second

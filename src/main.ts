@@ -10,9 +10,23 @@ interface Target {
   intervalMs: number;
 }
 
+interface Alias {
+  text: string;
+  color?: string | null; // null/undefined = inherit the set's group color
+}
+interface ThresholdSet {
+  name: string;
+  color: string;
+  good: number;
+  ok: number;
+  poor: number;
+  terrible: number;
+  aliases: Alias[];
+  builtin: boolean;
+}
 interface AppConfig {
   targets: Target[];
-  tags: TagProfile[];
+  sets: ThresholdSet[];
   theme?: string;
   aggregate?: string;
 }
@@ -80,7 +94,9 @@ function rangeMs(): number {
 }
 
 const rows = new Map<string, Row>();
-let profiles = new Map<string, TagProfile>();
+let sets: ThresholdSet[] = [];
+// Resolve a tag string (a set's name or one of its aliases) to its thresholds + color.
+let tagIndex = new Map<string, { profile: TagProfile; color: string; set: string }>();
 let lastLiveRefresh = 0;
 let editingId: string | null = null;
 
@@ -94,30 +110,43 @@ const rowsEl = document.querySelector<HTMLElement>("#rows")!;
 const modal = document.querySelector<HTMLElement>("#editor")!;
 const settingsModal = document.querySelector<HTMLElement>("#settings")!;
 
-// Settings categories map to tag names; gateway mirrors LAN.
-const CAT_TAG: Record<string, string> = { lan: "wifi", wan: "isp", inet: "internet" };
-const THRESH_DEFAULTS: Record<string, [number, number, number, number]> = {
-  lan: [10, 20, 40, 100],
-  wan: [25, 40, 80, 150],
-  inet: [30, 50, 100, 300],
-};
-
 const q = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
 // ---- helpers -------------------------------------------------------------
 
+// (Re)index every tag string — each set's name plus its aliases — to its resolved thresholds and
+// color (an alias inherits the set's group color unless it overrides). Retires the old hash color.
+function rebuildTagIndex(): void {
+  tagIndex = new Map();
+  for (const s of sets) {
+    const base: TagProfile = { tag: s.name, good: s.good, ok: s.ok, poor: s.poor, terrible: s.terrible };
+    tagIndex.set(s.name, { profile: base, color: s.color, set: s.name });
+    for (const a of s.aliases) {
+      tagIndex.set(a.text, { profile: { ...base, tag: a.text }, color: a.color || s.color, set: s.name });
+    }
+  }
+}
+function loadSets(cfgSets: ThresholdSet[]): void {
+  sets = cfgSets ?? [];
+  rebuildTagIndex();
+}
+
+const NEUTRAL = "#6b7280"; // color for an unknown tag (shouldn't happen once tags are constrained)
 function fallbackProfile(): TagProfile {
   return { tag: "?", good: 6, ok: 10, poor: 20, terrible: 40 };
 }
 function profileFor(tag: string): TagProfile {
-  return profiles.get(tag) ?? fallbackProfile();
+  return tagIndex.get(tag)?.profile ?? fallbackProfile();
 }
-
-const TAG_PALETTE = ["#4c8dff", "#a371f7", "#2bb0c4", "#c9a227", "#d2679a", "#5fa85f"];
 function tagColor(tag: string): string {
-  let h = 0;
-  for (const c of tag) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-  return TAG_PALETTE[h % TAG_PALETTE.length];
+  return tagIndex.get(tag)?.color ?? NEUTRAL;
+}
+// Every valid tag string (names + aliases), for autocomplete + validation.
+function allTags(): string[] {
+  return [...tagIndex.keys()];
+}
+function tagIsValid(tag: string): boolean {
+  return tagIndex.has(tag);
 }
 
 function slug(s: string): string {
@@ -462,13 +491,19 @@ async function saveEditor(): Promise<void> {
   if (!row) return;
   const label = q<HTMLInputElement>("#m-label").value.trim();
   const host = q<HTMLInputElement>("#m-host").value.trim();
-  const tag = q<HTMLInputElement>("#m-tag").value.trim() || "internet";
+  const tagEl = q<HTMLInputElement>("#m-tag");
+  const tag = tagEl.value.trim();
   // 1s floor: one poll per wall-clock second per target (matches the daemon's enforcement).
   const intervalMs = Math.max(
     1000,
     parseInt(q<HTMLInputElement>("#m-interval").value, 10) || 1000,
   );
   if (!host) return;
+  if (!tagIsValid(tag)) {
+    tagEl.classList.add("invalid");
+    tagEl.focus();
+    return;
+  }
 
   const updated: Target = { id: editingId, label: label || host, host, tag, intervalMs };
   try {
@@ -494,6 +529,7 @@ async function removeFromEditor(): Promise<void> {
 }
 
 function wireEditor(): void {
+  attachTagAutocomplete(q<HTMLInputElement>("#m-tag"));
   q<HTMLButtonElement>("#m-save").addEventListener("click", saveEditor);
   q<HTMLButtonElement>("#m-cancel").addEventListener("click", closeEditor);
   q<HTMLButtonElement>("#m-remove").addEventListener("click", removeFromEditor);
@@ -505,30 +541,12 @@ function wireEditor(): void {
   });
 }
 
-// ---- settings (thresholds) pop-up ---------------------------------------
+// ---- settings + threshold sets ------------------------------------------
 
-function setCat(cat: string, vals: [number, number, number, number]): void {
-  q<HTMLInputElement>(`#s-${cat}-good`).value = String(vals[0]);
-  q<HTMLInputElement>(`#s-${cat}-ok`).value = String(vals[1]);
-  q<HTMLInputElement>(`#s-${cat}-bad`).value = String(vals[2]);
-  q<HTMLInputElement>(`#s-${cat}-max`).value = String(vals[3]);
-}
-
-function getCat(cat: string): [number, number, number, number] {
-  const num = (id: string) => Math.max(1, parseFloat(q<HTMLInputElement>(id).value) || 0);
-  return [
-    num(`#s-${cat}-good`),
-    num(`#s-${cat}-ok`),
-    num(`#s-${cat}-bad`),
-    num(`#s-${cat}-max`),
-  ];
-}
+const setEditorModal = document.querySelector<HTMLElement>("#set-editor")!;
 
 async function openSettings(): Promise<void> {
-  for (const cat of Object.keys(CAT_TAG)) {
-    const p = profiles.get(CAT_TAG[cat]);
-    setCat(cat, p ? [p.good, p.ok, p.poor, p.terrible] : THRESH_DEFAULTS[cat]);
-  }
+  renderSetsList();
   document.querySelectorAll<HTMLInputElement>('input[name="theme"]').forEach((r) => {
     r.checked = r.value === themeSetting;
   });
@@ -536,6 +554,139 @@ async function openSettings(): Promise<void> {
   q<HTMLInputElement>("#s-poller-run").checked = pollerStatus.running;
   q<HTMLInputElement>("#s-poller-login").checked = pollerStatus.atLogin;
   settingsModal.hidden = false;
+}
+
+// The list of threshold sets in Settings; each row edits, and custom sets can be deleted.
+function renderSetsList(): void {
+  const list = q<HTMLElement>("#sets-list");
+  list.innerHTML = "";
+  sets.forEach((s, i) => {
+    const row = document.createElement("div");
+    row.className = "set-row";
+    const sw = document.createElement("span");
+    sw.className = "set-swatch";
+    sw.style.backgroundColor = s.color;
+    const name = document.createElement("span");
+    name.className = "set-name";
+    name.textContent = s.name;
+    const nums = document.createElement("span");
+    nums.className = "set-nums";
+    nums.textContent = `${s.good} / ${s.ok} / ${s.poor} / ${s.terrible}`;
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.textContent = "edit";
+    edit.addEventListener("click", () => openSetEditor(i));
+    row.append(sw, name, nums, edit);
+    if (!s.builtin) {
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "set-del";
+      del.textContent = "✕";
+      del.title = "Delete set";
+      del.addEventListener("click", () => deleteSet(i));
+      row.append(del);
+    }
+    list.append(row);
+  });
+}
+
+// ---- set editor (add / edit a threshold set) -----------------------------
+
+let editingSetIndex: number | null = null; // index into `sets`, or null for a new set
+let seAliases: { text: string; color: string | null }[] = [];
+
+function openSetEditor(index: number | null): void {
+  editingSetIndex = index;
+  const s: ThresholdSet =
+    index != null
+      ? sets[index]
+      : { name: "", color: "#4c8dff", good: 5, ok: 10, poor: 20, terrible: 40, aliases: [], builtin: false };
+  q<HTMLElement>("#se-title").textContent = index == null ? "New threshold set" : `Edit “${s.name}”`;
+  const nameEl = q<HTMLInputElement>("#se-name");
+  nameEl.value = s.name;
+  nameEl.disabled = s.builtin; // built-in names are fixed (alias-delete falls back to them)
+  q<HTMLInputElement>("#se-color").value = s.color;
+  q<HTMLInputElement>("#se-good").value = String(s.good);
+  q<HTMLInputElement>("#se-ok").value = String(s.ok);
+  q<HTMLInputElement>("#se-poor").value = String(s.poor);
+  q<HTMLInputElement>("#se-max").value = String(s.terrible);
+  seAliases = s.aliases.map((a) => ({ text: a.text, color: a.color ?? null }));
+  renderAliasRows();
+  validateSetEditor();
+  setEditorModal.hidden = false;
+}
+
+function seGroupColor(): string {
+  return q<HTMLInputElement>("#se-color").value;
+}
+
+function renderAliasRows(): void {
+  const box = q<HTMLElement>("#se-aliases");
+  box.innerHTML = "";
+  seAliases.forEach((a, i) => {
+    const row = document.createElement("div");
+    row.className = "alias-row";
+    const text = document.createElement("input");
+    text.type = "text";
+    text.className = "alias-text";
+    text.value = a.text;
+    text.placeholder = "alias";
+    text.addEventListener("input", () => {
+      a.text = text.value.trim();
+      validateSetEditor();
+    });
+    const chit = document.createElement("input");
+    chit.type = "color";
+    chit.className = "alias-chit";
+    chit.value = a.color ?? seGroupColor();
+    chit.title = a.color ? "custom color" : "inherits group color";
+    chit.addEventListener("input", () => {
+      a.color = chit.value;
+      renderAliasRows();
+    });
+    const reset = document.createElement("button");
+    reset.type = "button";
+    reset.className = "alias-reset";
+    reset.textContent = "↺";
+    reset.title = "Use group color";
+    reset.disabled = a.color == null;
+    reset.addEventListener("click", () => {
+      a.color = null;
+      renderAliasRows();
+    });
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "alias-del";
+    del.textContent = "✕";
+    del.addEventListener("click", () => {
+      seAliases.splice(i, 1);
+      renderAliasRows();
+      validateSetEditor();
+    });
+    row.append(text, chit, reset, del);
+    box.append(row);
+  });
+}
+
+// Highlight any name/alias that collides with a tag owned by another set (or repeats here) in red,
+// and disable OK while there's a dup or an empty name.
+function validateSetEditor(): void {
+  const name = q<HTMLInputElement>("#se-name").value.trim();
+  const others = new Set<string>();
+  sets.forEach((s, i) => {
+    if (i === editingSetIndex) return;
+    others.add(s.name);
+    s.aliases.forEach((a) => others.add(a.text));
+  });
+  const here = [name, ...seAliases.map((a) => a.text)].filter((t) => t.length > 0);
+  const counts = new Map<string, number>();
+  for (const t of here) counts.set(t, (counts.get(t) ?? 0) + 1);
+  const isDup = (t: string) => t.length > 0 && (others.has(t) || (counts.get(t) ?? 0) > 1);
+  q<HTMLInputElement>("#se-name").classList.toggle("dup", isDup(name));
+  q<HTMLElement>("#se-aliases")
+    .querySelectorAll<HTMLInputElement>(".alias-text")
+    .forEach((el) => el.classList.toggle("dup", isDup(el.value.trim())));
+  q<HTMLButtonElement>("#se-ok").disabled = name.length === 0 || here.some(isDup);
 }
 
 function closeSettings(): void {
@@ -626,30 +777,108 @@ function wirePoller(): void {
   window.setInterval(refreshPollerStatus, 4000);
 }
 
-async function saveSettings(): Promise<void> {
-  const mk = (tag: string, v: [number, number, number, number]): TagProfile => ({
-    tag,
-    good: v[0],
-    ok: v[1],
-    poor: v[2],
-    terrible: v[3],
-  });
-  const lan = getCat("lan");
-  const byTag = new Map(profiles);
-  byTag.set("wifi", mk("wifi", lan));
-  byTag.set("gateway", mk("gateway", lan)); // gateway follows LAN
-  byTag.set("isp", mk("isp", getCat("wan")));
-  byTag.set("internet", mk("internet", getCat("inet")));
-  const tags = [...byTag.values()];
+// Persist `next` sets, reload them, then reassign any target whose tag was removed/renamed to its
+// replacement, and re-render everything.
+async function commitSets(next: ThresholdSet[], convert?: Map<string, string>): Promise<void> {
+  let cfg: AppConfig;
   try {
-    await invoke("set_tags", { tags });
+    cfg = await invoke<AppConfig>("set_sets", { sets: next });
   } catch (e) {
-    console.error("set_tags failed", e);
+    console.error("set_sets failed", e);
     return;
   }
-  profiles = new Map(tags.map((t) => [t.tag, t]));
-  closeSettings(); // dismiss + un-dim immediately; the poller start/stop runs in the background
+  loadSets(cfg.sets);
+  if (convert && convert.size) {
+    for (const row of rows.values()) {
+      const repl = convert.get(row.target.tag);
+      if (repl && repl !== row.target.tag) {
+        const updated = { ...row.target, tag: repl };
+        try {
+          await invoke("update_target", { target: updated });
+        } catch (e) {
+          console.error("retag failed", e);
+        }
+        row.target = updated;
+        row.chip.textContent = repl;
+        row.chip.style.backgroundColor = tagColor(repl);
+      }
+    }
+  }
+  renderSetsList();
+  populateTagOptions();
   refreshAll();
+}
+
+async function saveSetEditor(): Promise<void> {
+  const num = (id: string) => Math.max(0, parseFloat(q<HTMLInputElement>(id).value) || 0);
+  const newSet: ThresholdSet = {
+    name: q<HTMLInputElement>("#se-name").value.trim(),
+    color: q<HTMLInputElement>("#se-color").value,
+    good: num("#se-good"),
+    ok: num("#se-ok"),
+    poor: num("#se-poor"),
+    terrible: num("#se-max"),
+    aliases: seAliases.filter((a) => a.text.length > 0).map((a) => ({ text: a.text, color: a.color })),
+    builtin: editingSetIndex != null ? sets[editingSetIndex].builtin : false,
+  };
+  const next = sets.slice();
+  const convert = new Map<string, string>();
+  if (editingSetIndex != null) {
+    const old = sets[editingSetIndex];
+    const newTags = new Set([newSet.name, ...newSet.aliases.map((a) => a.text)]);
+    for (const t of [old.name, ...old.aliases.map((a) => a.text)]) {
+      if (!newTags.has(t)) convert.set(t, newSet.name); // removed alias / rename -> base name
+    }
+    next[editingSetIndex] = newSet;
+  } else {
+    next.push(newSet);
+  }
+  setEditorModal.hidden = true;
+  await commitSets(next, convert);
+}
+
+async function deleteSet(index: number): Promise<void> {
+  const s = sets[index];
+  if (s.builtin) return;
+  const owned = new Set([s.name, ...s.aliases.map((a) => a.text)]);
+  const affected = [...rows.values()].filter((r) => owned.has(r.target.tag)).length;
+  const doDelete = async (dest: string | null) => {
+    const next = sets.slice();
+    next.splice(index, 1);
+    const convert = new Map<string, string>();
+    if (dest) for (const t of owned) convert.set(t, dest);
+    await commitSets(next, convert);
+  };
+  if (affected === 0) {
+    await doDelete(null);
+  } else {
+    openDeleteSetPrompt(s.name, affected, doDelete);
+  }
+}
+
+// Prompt when deleting a custom set that has targets: pick a destination tag to convert them to.
+const setDeleteModal = document.querySelector<HTMLElement>("#set-delete")!;
+function openDeleteSetPrompt(name: string, count: number, onDelete: (dest: string) => void): void {
+  q<HTMLElement>("#sd-msg").textContent = `Delete “${name}” — converts ${count} target${count === 1 ? "" : "s"} to:`;
+  const dest = q<HTMLInputElement>("#sd-dest");
+  dest.value = "";
+  const ok = q<HTMLButtonElement>("#sd-ok");
+  const check = () => {
+    ok.disabled = !tagIsValid(dest.value.trim());
+  };
+  dest.oninput = check;
+  check();
+  ok.onclick = () => {
+    setDeleteModal.hidden = true;
+    onDelete(dest.value.trim());
+  };
+  q<HTMLButtonElement>("#sd-cancel").onclick = () => (setDeleteModal.hidden = true);
+  setDeleteModal.hidden = false;
+}
+
+// Save now covers theme (live) + poller; threshold sets are saved live via the set editor.
+async function saveSettings(): Promise<void> {
+  closeSettings();
   void applyPollerSettings();
 }
 
@@ -657,9 +886,19 @@ function wireSettings(): void {
   q<HTMLButtonElement>("#settings-btn").addEventListener("click", openSettings);
   q<HTMLButtonElement>("#s-save").addEventListener("click", saveSettings);
   q<HTMLButtonElement>("#s-cancel").addEventListener("click", closeSettings);
-  q<HTMLButtonElement>("#s-reset").addEventListener("click", () => {
-    for (const cat of Object.keys(THRESH_DEFAULTS)) setCat(cat, THRESH_DEFAULTS[cat]);
+  q<HTMLButtonElement>("#sets-add").addEventListener("click", () => openSetEditor(null));
+
+  // Set-editor wiring.
+  q<HTMLInputElement>("#se-name").addEventListener("input", validateSetEditor);
+  q<HTMLInputElement>("#se-color").addEventListener("input", renderAliasRows);
+  q<HTMLButtonElement>("#se-add-alias").addEventListener("click", () => {
+    seAliases.push({ text: "", color: null });
+    renderAliasRows();
+    validateSetEditor();
   });
+  q<HTMLButtonElement>("#se-ok").addEventListener("click", saveSetEditor);
+  q<HTMLButtonElement>("#se-cancel").addEventListener("click", () => (setEditorModal.hidden = true));
+
   document.querySelectorAll<HTMLInputElement>('input[name="theme"]').forEach((r) =>
     r.addEventListener("change", async (e) => {
       themeSetting = (e.target as HTMLInputElement).value;
@@ -675,7 +914,11 @@ function wireSettings(): void {
     if (e.target === settingsModal) closeSettings();
   });
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !settingsModal.hidden) closeSettings();
+    if (e.key === "Escape") {
+      if (!setEditorModal.hidden) setEditorModal.hidden = true;
+      else if (!setDeleteModal.hidden) setDeleteModal.hidden = true;
+      else if (!settingsModal.hidden) closeSettings();
+    }
   });
 }
 
@@ -950,18 +1193,112 @@ function togglePause(): void {
   refreshAll();
 }
 
+// Custom tag autocomplete: suggests matching tags; Enter picks the highlighted one and does
+// nothing when nothing matches — so an invalid tag can't be committed. A valid tag (a set's name
+// or an alias) is required to add/save a target.
+function attachTagAutocomplete(input: HTMLInputElement): void {
+  const menu = document.createElement("div");
+  menu.className = "ac-menu";
+  menu.hidden = true;
+  document.body.append(menu);
+  let items: string[] = [];
+  let hi = -1;
+
+  const close = () => {
+    menu.hidden = true;
+    hi = -1;
+  };
+  const render = () => {
+    menu.innerHTML = "";
+    items.forEach((t, i) => {
+      const el = document.createElement("div");
+      el.className = "ac-item" + (i === hi ? " hi" : "");
+      const sw = document.createElement("span");
+      sw.className = "ac-sw";
+      sw.style.backgroundColor = tagColor(t);
+      const lbl = document.createElement("span");
+      lbl.textContent = t;
+      el.append(sw, lbl);
+      el.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        pick(t);
+      });
+      menu.append(el);
+    });
+    const r = input.getBoundingClientRect();
+    menu.style.left = `${r.left}px`;
+    menu.style.top = `${r.bottom + 2}px`;
+    menu.style.minWidth = `${r.width}px`;
+  };
+  const openMenu = () => {
+    const v = input.value.trim().toLowerCase();
+    items = allTags()
+      .filter((t) => t.toLowerCase().includes(v))
+      .sort((a, b) => {
+        const ap = a.toLowerCase().startsWith(v) ? 0 : 1;
+        const bp = b.toLowerCase().startsWith(v) ? 0 : 1;
+        return ap - bp || a.localeCompare(b);
+      });
+    if (!items.length) {
+      close();
+      return;
+    }
+    hi = 0;
+    render();
+    menu.hidden = false;
+  };
+  const pick = (t: string) => {
+    input.value = t;
+    input.classList.remove("invalid");
+    close();
+  };
+
+  input.addEventListener("input", openMenu);
+  input.addEventListener("focus", openMenu);
+  input.addEventListener("blur", () => window.setTimeout(close, 120));
+  input.addEventListener("keydown", (e) => {
+    if (menu.hidden) return; // no menu -> let Enter propagate (the submit handler validates)
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      hi = Math.min(hi + 1, items.length - 1);
+      render();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      hi = Math.max(hi - 1, 0);
+      render();
+    } else if (e.key === "Enter") {
+      if (hi >= 0 && items[hi] && items[hi] !== input.value.trim()) {
+        e.preventDefault();
+        e.stopPropagation();
+        pick(items[hi]); // select the highlighted match (doesn't submit)
+      } else {
+        close(); // value already equals a suggestion (or none) -> allow the submit through
+      }
+    } else if (e.key === "Escape") {
+      e.stopPropagation();
+      close();
+    }
+  });
+}
+
 function wireAddForm(): void {
   const form = q<HTMLFormElement>("#add-form");
   const labelI = q<HTMLInputElement>("#f-label");
   const hostI = q<HTMLInputElement>("#f-host");
   const tagI = q<HTMLInputElement>("#f-tag");
+  attachTagAutocomplete(tagI);
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const label = labelI.value.trim();
     const host = hostI.value.trim();
-    const tag = tagI.value.trim() || "internet";
+    const tag = tagI.value.trim();
     if (!host) return;
+    if (!tagIsValid(tag)) {
+      tagI.classList.add("invalid");
+      tagI.focus();
+      return;
+    }
     const target: Target = {
       id: `${slug(label || host)}-${Math.floor(Math.random() * 1e6)}`,
       label: label || host,
@@ -983,7 +1320,7 @@ function wireAddForm(): void {
 function populateTagOptions(): void {
   const list = q<HTMLDataListElement>("#tag-options");
   list.innerHTML = "";
-  for (const t of profiles.keys()) {
+  for (const t of allTags()) {
     const opt = document.createElement("option");
     opt.value = t;
     list.append(opt);
@@ -1179,7 +1516,7 @@ async function respondInvite(accept: boolean): Promise<void> {
 
 async function reloadTargets(): Promise<void> {
   const cfg = await invoke<AppConfig>("get_config");
-  profiles = new Map(cfg.tags.map((t) => [t.tag, t]));
+  loadSets(cfg.sets);
   for (const t of cfg.targets) {
     if (!rows.has(t.id)) await addRow(t);
   }
@@ -1503,7 +1840,7 @@ async function main(): Promise<void> {
   }
 
   const cfg = await invoke<AppConfig>("get_config");
-  profiles = new Map(cfg.tags.map((t) => [t.tag, t]));
+  loadSets(cfg.sets);
   themeSetting = cfg.theme || "system";
   aggregate = cfg.aggregate || "worst";
   applyTheme();

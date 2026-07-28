@@ -184,7 +184,7 @@ pub fn run() {
             commands::update_target,
             commands::remove_target,
             commands::reorder_targets,
-            commands::set_tags,
+            commands::set_sets,
             commands::set_theme,
             commands::set_aggregate,
             commands::get_node,

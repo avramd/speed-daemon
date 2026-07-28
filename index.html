@@ -13,7 +13,7 @@
       <form id="add-form" class="add-form">
         <input id="f-label" placeholder="label" size="10" />
         <input id="f-host" placeholder="host or IP" size="16" required />
-        <input id="f-tag" placeholder="tag" size="8" list="tag-options" />
+        <input id="f-tag" placeholder="tag" size="8" autocomplete="off" />
         <button type="submit">add</button>
       </form>
       <span id="window-range" class="window-range"></span>
@@ -73,7 +73,7 @@
         <h2>Edit target</h2>
         <label>Label <input id="m-label" /></label>
         <label>Host / IP <input id="m-host" /></label>
-        <label>Tag <input id="m-tag" list="tag-options" /></label>
+        <label>Tag <input id="m-tag" autocomplete="off" /></label>
         <label>Delay <span class="unit">ms between probes</span>
           <input id="m-interval" type="number" min="1000" step="1000" />
         </label>
@@ -102,38 +102,61 @@
           <label><input type="checkbox" id="s-poller-login" /> Launch at login</label>
           <span id="s-poller-state" class="hint"></span>
         </div>
-        <h3 class="sub">Response-time thresholds (ms)</h3>
-        <div class="thresh-grid">
-          <span></span>
+        <h3 class="sub">
+          Response-time thresholds (ms)
+          <button id="sets-add" class="mini-btn" type="button" title="Add a threshold set">+</button>
+        </h3>
+        <div id="sets-list" class="sets-list"></div>
+        <p class="hint">Each target's tag maps to a set. A tag defaults to its set's color; the set's name is a usable tag too.</p>
+        <div class="dialog-actions">
+          <span class="spacer"></span>
+          <button id="s-cancel" type="button">Cancel</button>
+          <button id="s-save" class="primary" type="button">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- threshold-set editor -->
+    <div id="set-editor" class="modal" hidden>
+      <div class="dialog">
+        <h2 id="se-title">Threshold set</h2>
+        <div class="se-head">
+          <label>color <input id="se-color" type="color" /></label>
+          <label class="se-name-lbl">name <input id="se-name" type="text" placeholder="name" /></label>
+        </div>
+        <div class="se-grid">
           <span class="th-head">good</span>
           <span class="th-head">ok</span>
           <span class="th-head">bad</span>
           <span class="th-head">max</span>
-
-          <label class="th-row">LAN</label>
-          <input id="s-lan-good" type="number" min="1" step="1" />
-          <input id="s-lan-ok" type="number" min="1" step="1" />
-          <input id="s-lan-bad" type="number" min="1" step="1" />
-          <input id="s-lan-max" type="number" min="1" step="1" />
-
-          <label class="th-row">WAN</label>
-          <input id="s-wan-good" type="number" min="1" step="1" />
-          <input id="s-wan-ok" type="number" min="1" step="1" />
-          <input id="s-wan-bad" type="number" min="1" step="1" />
-          <input id="s-wan-max" type="number" min="1" step="1" />
-
-          <label class="th-row">Internet</label>
-          <input id="s-inet-good" type="number" min="1" step="1" />
-          <input id="s-inet-ok" type="number" min="1" step="1" />
-          <input id="s-inet-bad" type="number" min="1" step="1" />
-          <input id="s-inet-max" type="number" min="1" step="1" />
+          <input id="se-good" type="number" min="0" step="1" />
+          <input id="se-ok" type="number" min="0" step="1" />
+          <input id="se-poor" type="number" min="0" step="1" />
+          <input id="se-max" type="number" min="0" step="1" />
         </div>
-        <p class="hint">Gateway follows LAN. “max” is the graph ceiling — higher values clip to full height.</p>
+        <h3 class="sub">
+          Aliases
+          <button id="se-add-alias" class="mini-btn" type="button" title="Add an alias">+</button>
+        </h3>
+        <div id="se-aliases" class="aliases"></div>
+        <p class="hint">A target may use the name or any alias; a tag defaults to the group color, with a chit to override. Names/aliases are unique across all sets.</p>
         <div class="dialog-actions">
-          <button id="s-reset" type="button">Reset to defaults</button>
           <span class="spacer"></span>
-          <button id="s-cancel" type="button">Cancel</button>
-          <button id="s-save" class="primary" type="button">Save</button>
+          <button id="se-cancel" type="button">Cancel</button>
+          <button id="se-ok" class="primary" type="button">OK</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- delete-set confirm (convert its targets) -->
+    <div id="set-delete" class="modal" hidden>
+      <div class="dialog">
+        <p id="sd-msg"></p>
+        <input id="sd-dest" type="text" list="tag-options" placeholder="tag" />
+        <div class="dialog-actions">
+          <span class="spacer"></span>
+          <button id="sd-cancel" type="button">Cancel</button>
+          <button id="sd-ok" class="primary" type="button">Delete</button>
         </div>
       </div>
     </div>

@@ -1,6 +1,6 @@
 use crate::config;
 use crate::db::Db;
-use crate::model::{AppConfig, Bucket, NodeInfo, Peer, TagProfile, Target, WindowStats};
+use crate::model::{AppConfig, Bucket, NodeInfo, Peer, Target, ThresholdSet, WindowStats};
 use crate::net::Net;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -444,9 +444,12 @@ pub fn reorder_targets(
 }
 
 #[tauri::command]
-pub fn set_tags(cfg: State<Arc<ConfigState>>, tags: Vec<TagProfile>) -> Result<AppConfig, String> {
+pub fn set_sets(
+    cfg: State<Arc<ConfigState>>,
+    sets: Vec<ThresholdSet>,
+) -> Result<AppConfig, String> {
     let mut guard = cfg.config.lock().unwrap();
-    guard.tags = tags;
+    guard.sets = sets;
     save(&cfg, &guard)?;
     Ok(guard.clone())
 }

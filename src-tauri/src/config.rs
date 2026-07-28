@@ -1,4 +1,4 @@
-use crate::model::{AppConfig, NodeInfo, TagProfile, Target};
+use crate::model::{Alias, AppConfig, NodeInfo, TagProfile, ThresholdSet, Target};
 use std::path::{Path, PathBuf};
 use tauri::Manager;
 
@@ -50,36 +50,20 @@ pub fn data_dir() -> PathBuf {
 
 pub fn load_or_default(path: &Path) -> AppConfig {
     let mut cfg = match std::fs::read_to_string(path) {
-        Ok(s) => match toml::from_str::<AppConfig>(&s) {
-            Ok(mut cfg) => {
-                // One-time upgrade: if the tag thresholds are still the original
-                // auto-generated defaults, adopt the new defaults (keeping the user's
-                // targets). Customized thresholds are left untouched.
-                if tags_are_legacy(&cfg.tags) {
-                    cfg.tags = default_config().tags;
-                }
-                cfg
-            }
-            Err(_) => default_config(),
-        },
+        Ok(s) => toml::from_str::<AppConfig>(&s).unwrap_or_else(|_| default_config()),
         Err(_) => default_config(),
     };
+    // One-time migration: fold the legacy per-tag profiles into threshold sets.
+    if cfg.sets.is_empty() {
+        cfg.sets = if cfg.tags.is_empty() {
+            built_in_sets()
+        } else {
+            migrate_tags_to_sets(&cfg.tags)
+        };
+    }
+    cfg.tags.clear(); // the legacy field is never persisted again
     ensure_node(&mut cfg);
     cfg
-}
-
-/// True if `tags` matches the original 6/10/20/40-times-multiplier seed exactly.
-fn tags_are_legacy(tags: &[TagProfile]) -> bool {
-    let legacy = [
-        ("wifi", 6.0, 10.0, 20.0, 40.0),
-        ("gateway", 6.0, 10.0, 20.0, 40.0),
-        ("isp", 12.0, 20.0, 40.0, 80.0),
-        ("internet", 15.0, 25.0, 50.0, 100.0),
-    ];
-    tags.len() == legacy.len()
-        && tags.iter().zip(legacy.iter()).all(|(t, l)| {
-            t.tag == l.0 && t.good == l.1 && t.ok == l.2 && t.poor == l.3 && t.terrible == l.4
-        })
 }
 
 pub fn save(path: &Path, cfg: &AppConfig) -> anyhow::Result<()> {
@@ -104,28 +88,96 @@ fn target(id: &str, label: &str, host: &str, tag: &str) -> Target {
     }
 }
 
-// good / ok / bad(poor) / max(terrible) cutoffs in ms.
-fn profile(tag: &str, good: f64, ok: f64, bad: f64, max: f64) -> TagProfile {
-    TagProfile {
-        tag: tag.into(),
-        good,
-        ok,
-        poor: bad,
-        terrible: max,
+// Built-in group colors (previously the hashed tag colors we're retiring).
+const GREEN: &str = "#5fa85f";
+const PINK: &str = "#d2679a";
+const CYAN: &str = "#2bb0c4";
+const GOLD: &str = "#c9a227";
+
+fn alias(text: &str, color: Option<&str>) -> Alias {
+    Alias {
+        text: text.into(),
+        color: color.map(|c| c.into()),
     }
+}
+
+/// The built-in threshold sets (self is added in the self phase). `wifi`/`gateway` share LAN's
+/// thresholds but keep their distinct colors as per-alias overrides.
+pub fn built_in_sets() -> Vec<ThresholdSet> {
+    vec![
+        ThresholdSet {
+            name: "LAN".into(),
+            color: GREEN.into(),
+            good: 10.0,
+            ok: 20.0,
+            poor: 40.0,
+            terrible: 100.0,
+            aliases: vec![alias("wifi", None), alias("gateway", Some(PINK))],
+            builtin: true,
+        },
+        ThresholdSet {
+            name: "ISP".into(),
+            color: CYAN.into(),
+            good: 25.0,
+            ok: 40.0,
+            poor: 80.0,
+            terrible: 150.0,
+            aliases: vec![alias("isp", None)],
+            builtin: true,
+        },
+        ThresholdSet {
+            name: "Internet".into(),
+            color: GOLD.into(),
+            good: 30.0,
+            ok: 50.0,
+            poor: 100.0,
+            terrible: 300.0,
+            aliases: vec![alias("internet", None)],
+            builtin: true,
+        },
+    ]
+}
+
+/// Fold legacy per-tag profiles into the built-in sets, carrying over any edited thresholds; any
+/// tag that isn't one of the four known ones becomes its own custom set.
+fn migrate_tags_to_sets(tags: &[TagProfile]) -> Vec<ThresholdSet> {
+    let mut sets = built_in_sets();
+    let find = |t: &str| tags.iter().find(|p| p.tag == t);
+    let apply = |s: &mut ThresholdSet, p: &TagProfile| {
+        s.good = p.good;
+        s.ok = p.ok;
+        s.poor = p.poor;
+        s.terrible = p.terrible;
+    };
+    if let Some(p) = find("wifi").or_else(|| find("gateway")) {
+        apply(&mut sets[0], p);
+    }
+    if let Some(p) = find("isp") {
+        apply(&mut sets[1], p);
+    }
+    if let Some(p) = find("internet") {
+        apply(&mut sets[2], p);
+    }
+    for p in tags {
+        if !matches!(p.tag.as_str(), "wifi" | "gateway" | "isp" | "internet") {
+            sets.push(ThresholdSet {
+                name: p.tag.clone(),
+                color: GREEN.into(),
+                good: p.good,
+                ok: p.ok,
+                poor: p.poor,
+                terrible: p.terrible,
+                aliases: vec![],
+                builtin: false,
+            });
+        }
+    }
+    sets
 }
 
 /// Seed matching the user's described layout. All values are starting points; the user
 /// edits hosts and thresholds in-app or directly in the TOML.
 pub fn default_config() -> AppConfig {
-    let tags = vec![
-        // gateway follows LAN
-        profile("wifi", 10.0, 20.0, 40.0, 100.0),
-        profile("gateway", 10.0, 20.0, 40.0, 100.0),
-        profile("isp", 25.0, 40.0, 80.0, 150.0),
-        profile("internet", 30.0, 50.0, 100.0, 300.0),
-    ];
-
     let targets = vec![
         target("wifi-a", "LAN host A", "192.168.1.2", "wifi"),
         target("wifi-b", "LAN host B", "192.168.1.3", "wifi"),
@@ -140,7 +192,8 @@ pub fn default_config() -> AppConfig {
 
     AppConfig {
         targets,
-        tags,
+        sets: built_in_sets(),
+        tags: Vec::new(),
         node: NodeInfo::default(),
         peers: Vec::new(),
         theme: "system".into(),

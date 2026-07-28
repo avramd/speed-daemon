@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// Expectation thresholds (in milliseconds) for a tag. A sample's color band is the
-/// first threshold it falls under: <= good -> green, <= ok -> yellow, <= poor -> orange,
-/// <= terrible -> red, and anything greater stays red (saturated). These also drive the
-/// log-height scaling on the frontend.
+/// Expectation thresholds (in milliseconds). A sample's color band is the first threshold it
+/// falls under: <= good -> green, <= ok -> yellow, <= poor -> orange, <= terrible -> red (which
+/// is also the graph ceiling). Kept as the legacy per-tag shape for config migration; the live
+/// model is `ThresholdSet` below.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TagProfile {
     pub tag: String,
@@ -11,6 +11,31 @@ pub struct TagProfile {
     pub ok: f64,
     pub poor: f64,
     pub terrible: f64,
+}
+
+/// One tag (alias) within a threshold set. `color` None means it inherits the set's group color.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Alias {
+    pub text: String,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+/// A named threshold set: shared expectation thresholds + a group color, plus a list of alias
+/// tags (each optionally recolored). The `name` is itself a usable tag (colored by `color`). A
+/// target's `tag` must match a set's name or one of its aliases. `builtin` sets can't be deleted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThresholdSet {
+    pub name: String,
+    pub color: String,
+    pub good: f64,
+    pub ok: f64,
+    pub poor: f64,
+    pub terrible: f64,
+    #[serde(default)]
+    pub aliases: Vec<Alias>,
+    #[serde(default)]
+    pub builtin: bool,
 }
 
 /// A single probe destination.
@@ -72,10 +97,15 @@ fn default_aggregate() -> String {
     "worst".into()
 }
 
-/// Whole persisted configuration: probe targets + tag expectation profiles + networking.
+/// Whole persisted configuration: probe targets + threshold sets + networking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub targets: Vec<Target>,
+    /// Threshold sets (the live model). Serialized going forward.
+    #[serde(default)]
+    pub sets: Vec<ThresholdSet>,
+    /// Legacy per-tag profiles — read only to migrate old configs into `sets`, never written.
+    #[serde(default, skip_serializing)]
     pub tags: Vec<TagProfile>,
     #[serde(default)]
     pub node: NodeInfo,

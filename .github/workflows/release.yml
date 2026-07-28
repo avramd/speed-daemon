@@ -45,6 +45,22 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      # Tauri's universal build lipos only the app binary, not the extra `speedd` helper — it then
+      # looks for a universal target/universal-apple-darwin/release/speedd that never gets created,
+      # and the bundle step fails. Build speedd for both arches and lipo it into place first;
+      # tauri-action's own cargo builds are cache hits after this, and it leaves this file alone.
+      - name: Universalize the speedd helper binary
+        run: |
+          cd src-tauri
+          cargo build --release --bin speedd --target aarch64-apple-darwin
+          cargo build --release --bin speedd --target x86_64-apple-darwin
+          mkdir -p target/universal-apple-darwin/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/speedd \
+            target/x86_64-apple-darwin/release/speedd \
+            -output target/universal-apple-darwin/release/speedd
+          lipo -info target/universal-apple-darwin/release/speedd
+
       - name: Build, sign, notarize, and draft the release
         uses: tauri-apps/tauri-action@v0
         env:
